@@ -19,7 +19,7 @@ import {
 // its signatures, and it is how long-term validation data and archive
 // timestamps go in after the seal.
 //
-// This handles the files SignuDoc itself writes: a classic cross-reference
+// This handles the files DocSeal itself writes: a classic cross-reference
 // table (pdf-lib saved with object streams off), possibly followed by
 // earlier updates of the same kind. A file whose last section is a
 // cross-reference stream is refused.

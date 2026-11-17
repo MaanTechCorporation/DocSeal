@@ -6,7 +6,11 @@ import {
   getAddressDomain,
   isResendTestSender,
 } from "./services/email-addresses.ts";
-import { resolveEmailDriver } from "./services/email.ts";
+import {
+  getMailgunConfig,
+  mailgunFetch,
+  resolveEmailDriver,
+} from "./services/email.ts";
 import {
   getSettings,
   markEmailReady,
@@ -457,6 +461,118 @@ async function inspectEmail({
   };
 }
 
+type MailgunDomainAnswer = {
+  domain?: { state?: string };
+  message?: string;
+  sending_dns_records?: {
+    name?: string;
+    record_type?: string;
+    valid?: string;
+    value?: string;
+  }[];
+};
+
+/**
+ * Mailgun's side of the status: the domain is added in Mailgun's dashboard
+ * (MAILGUN_DOMAIN), so this only reads whether it is active and, if not,
+ * which DNS records are still missing. `verify` asks Mailgun to look again.
+ */
+async function getMailgunStatus(
+  options: EmailStatusOptions,
+  verify: boolean,
+): Promise<EmailStatus> {
+  const env = options.env ?? process.env;
+  const config = getMailgunConfig(env);
+
+  if (!config) {
+    return { onVercel: readEnv(env, "VERCEL") === "1", state: "missing_key" };
+  }
+
+  const settings = options.settings ?? (await getSettings(env));
+  const markReady =
+    options.recordReady ??
+    ((ready: boolean) => defaultRecordReady(ready, settings));
+  const senderAddress = extractEmailAddress(
+    buildEmailAddresses(settings, `noreply@${config.domain}`).senderAddress,
+  );
+  const domain = getAddressDomain(senderAddress) ?? config.domain;
+
+  if (domain !== config.domain && !domain.endsWith(`.${config.domain}`)) {
+    return {
+      message: `Mailgun is set up to send for ${config.domain}. Use a "Send email from" address at ${config.domain}.`,
+      senderAddress,
+      state: "error",
+    };
+  }
+
+  const path = `/v4/domains/${encodeURIComponent(config.domain)}`;
+
+  try {
+    if (verify) {
+      await mailgunFetch(config, `${path}/verify`, { method: "PUT" });
+    }
+
+    const response = await mailgunFetch(config, path);
+    const answer = (await response
+      .json()
+      .catch(() => ({}))) as MailgunDomainAnswer;
+
+    if (!response.ok) {
+      return {
+        message: `Mailgun: ${answer.message ?? response.statusText}`,
+        senderAddress,
+        state: "error",
+      };
+    }
+
+    if (answer.domain?.state === "active") {
+      await markReady(true);
+
+      return { domain: config.domain, senderAddress, state: "ready" };
+    }
+
+    await markReady(false);
+
+    return {
+      domain: config.domain,
+      records: (answer.sending_dns_records ?? []).flatMap((record) =>
+        record.name && record.record_type && record.value
+          ? [
+              {
+                name: record.name,
+                priority: null,
+                purpose: "Sending",
+                status: record.valid === "valid" ? "verified" : "pending",
+                type: record.record_type,
+                value: record.value,
+              },
+            ]
+          : [],
+      ),
+      senderAddress,
+      state: "domain_pending",
+    };
+  } catch (error) {
+    return {
+      message:
+        error instanceof Error ? error.message : "Mailgun is unreachable.",
+      senderAddress,
+      state: "error",
+    };
+  }
+}
+
+function usesMailgun(options: EmailStatusOptions): boolean {
+  try {
+    return (
+      !options.domainsClient &&
+      resolveEmailDriver(options.env ?? process.env) === "mailgun"
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Works out whether email can be sent, asking Resend about the sender's
  * domain when there is one to ask about. Also keeps the "email works" mark
@@ -465,6 +581,10 @@ async function inspectEmail({
 export async function getEmailStatus(
   options: EmailStatusOptions = {},
 ): Promise<EmailStatus> {
+  if (usesMailgun(options)) {
+    return getMailgunStatus(options, false);
+  }
+
   const { client, domainId, markReady, status } = await inspectEmail(options);
 
   if (status.state !== "domain_pending" || !client || !domainId) {
@@ -484,6 +604,10 @@ export async function getEmailStatus(
 export async function addEmailDomain(
   options: EmailStatusOptions = {},
 ): Promise<EmailStatus> {
+  if (usesMailgun(options)) {
+    return getMailgunStatus(options, false);
+  }
+
   const { client, domainId, markReady, status } = await inspectEmail(options);
 
   if (status.state === "domain_pending" && client && domainId) {
@@ -523,6 +647,10 @@ export async function addEmailDomain(
 export async function recheckEmailDomain(
   options: EmailStatusOptions = {},
 ): Promise<EmailStatus> {
+  if (usesMailgun(options)) {
+    return getMailgunStatus(options, true);
+  }
+
   const { client, domainId, markReady, status } = await inspectEmail(options);
 
   if (status.state !== "domain_pending" || !client || !domainId) {

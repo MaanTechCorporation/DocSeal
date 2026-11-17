@@ -419,7 +419,7 @@ export type EnvelopeDetailData = {
   /** Sent in Part 11 mode: a void needs a reason. */
   part11: boolean;
   /**
-   * How signers sign, when not with SignuDoc's own simple signature: for
+   * How signers sign, when not with DocSeal's own simple signature: for
    * example "Qualified electronic signatures through eID Easy".
    */
   signatureTypeLabel: string | null;

@@ -63,7 +63,7 @@ async function makePdf(): Promise<PDFDocument> {
 async function sealedWith(pki: TestPki, { timestamp = true } = {}) {
   return saveSealedPdf(await makePdf(), pki.seal, {
     name: "Harbour & Finch",
-    reason: "Signed with SignuDoc",
+    reason: "Signed with DocSeal",
     timestampUrl: timestamp ? pki.timestampUrl : null,
   });
 }
@@ -400,7 +400,7 @@ test("a self-made seal without a timestamp is left as it is", async () => {
     publicKeyPem: publicKey,
   });
   const sealed = await sealForTheLongTerm(await makePdf(), identity, {
-    name: "SignuDoc",
+    name: "DocSeal",
     reason: "Signed",
   });
 

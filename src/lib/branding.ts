@@ -5,14 +5,14 @@ import type { ResolvedSettings } from "./settings.ts";
 //
 // A neutral install (the default) carries the name of the organization that
 // runs it, links to that organization's own terms and privacy policy, and
-// says "Powered by SignuDoc" in the footer. Hosted mode (HOSTED_MODE=1) is
-// SignuDoc run as a public service: its own name, landing page and legal
+// says "Powered by DocSeal" in the footer. Hosted mode (HOSTED_MODE=1) is
+// DocSeal run as a public service: its own name, landing page and legal
 // pages. An install's own logo and color are not used there.
 
-export const SIGNUDOC_NAME = "SignuDoc";
-// The project's home is its repository. There is no SignuDoc-run site that
+export const DOCSEAL_NAME = "DocSeal";
+// The project's home is its repository. There is no DocSeal-run site that
 // an install should send its visitors to, and no address there to write to.
-export const SIGNUDOC_URL = "https://github.com/NYLLON-SOFTWARE/SignuDoc";
+export const DOCSEAL_URL = "https://github.com/NYLLON-SOFTWARE/SignuDoc";
 
 /** Where the install's logo is served. Public: it is shown to signers. */
 export const BRAND_LOGO_PATH = "/api/brand/logo";
@@ -54,7 +54,7 @@ export type Branding = {
   termsUrl: string | null;
 };
 
-/** SignuDoc under its own name. Also what a page shows before it knows better. */
+/** DocSeal under its own name. Also what a page shows before it knows better. */
 export const HOSTED_BRANDING: Branding = {
   brandColor: null,
   contactUrl: "/contact",
@@ -62,7 +62,7 @@ export const HOSTED_BRANDING: Branding = {
   logoUrl: null,
   organizationName: null,
   privacyUrl: "/privacy",
-  productName: SIGNUDOC_NAME,
+  productName: DOCSEAL_NAME,
   signupAvailable: true,
   supportAddress: null,
   termsUrl: "/terms",
@@ -94,7 +94,7 @@ export function buildBranding(settings: ResolvedSettings): Branding {
         : buildBrandLogoPath(settings.logoVersion),
     organizationName,
     privacyUrl: settings.privacyUrl,
-    productName: organizationName ?? SIGNUDOC_NAME,
+    productName: organizationName ?? DOCSEAL_NAME,
     signupAvailable,
     supportAddress: settings.supportAddress,
     termsUrl: settings.termsUrl,

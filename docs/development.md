@@ -1,6 +1,6 @@
 # Development
 
-How to run SignuDoc on your own machine, test it, and find your way around the code. For deploying and running an install, see the [self-hosting guide](self-hosting.md).
+How to run DocSeal on your own machine, test it, and find your way around the code. For deploying and running an install, see the [self-hosting guide](self-hosting.md).
 
 ## Run it locally
 
@@ -12,7 +12,7 @@ For development, or to try it on your own machine first.
 npm install
 ```
 
-SignuDoc targets Node.js 24 and is built on Next.js 16.
+DocSeal targets Node.js 24 and is built on Next.js 16.
 
 ### 2. Create your environment file
 
@@ -69,7 +69,7 @@ The first time you open the app it takes you to `/setup`, where you name the org
 4. Review and send.
 5. The first signer receives a secure link.
 6. Each signer completes their turn in order.
-7. SignuDoc finalizes the signed PDF and audit certificate when the last signer finishes.
+7. DocSeal finalizes the signed PDF and audit certificate when the last signer finishes.
 
 People added to receive a copy do not sign. They are sent the finished document and its certificate at step 7 and nothing before it.
 
@@ -94,13 +94,13 @@ E2E_STORAGE_DRIVER=blob BLOB_READ_WRITE_TOKEN=... npm run test:e2e
 
 ## Database
 
-SignuDoc uses Postgres as its only database and talks to it with `pg`. Any Postgres 15 or newer works, including Neon and Supabase.
+DocSeal uses Postgres as its only database and talks to it with `pg`. Any Postgres 15 or newer works, including Neon and Supabase.
 
 The schema lives in `db/migrations` as plain SQL files. `npm run db:migrate` applies the ones that have not run yet and records them in the `signudoc_migrations` table, so it is safe to run on every deploy.
 
 ## Email delivery
 
-SignuDoc sends transactional email through Resend.
+DocSeal sends transactional email through Resend.
 
 - The support address, where replies go, is asked for when the site is set up. It and the address email is sent from can be changed by the administrator under Settings, Organization. The sender address must be at a domain verified with Resend; the same page adds the domain to Resend, lists the DNS records and checks them. With a Resend API key that is only allowed to send, it points you at Resend's dashboard for that step instead.
 - `RESEND_FROM_EMAIL` and `SUPPORT_EMAIL` are optional. When set they take the place of the addresses saved in Settings, which then cannot be changed there, and with `SUPPORT_EMAIL` set the setup page does not ask for a support address.
@@ -137,9 +137,9 @@ npm run test:db
 npm run test:e2e
 ```
 
-`npm test` runs the unit tests, which need nothing else running. `npm run test:db` runs the few tests that need a real Postgres (the rate limit counter, the cleanup job's lock and first-run setup) against the `signudoc_e2e` database.
+`npm test` runs the unit tests, which need nothing else running. `npm run test:db` runs the few tests that need a real Postgres (the rate limit counter, the cleanup job's lock and first-run setup) against the `docseal_e2e` database.
 
-`npm run test:e2e` runs the Playwright end-to-end test. It starts the app against a separate `signudoc_e2e` database on the same Postgres server, sets the site up as its first visitor, signs up a sender, sends a PDF, signs it as the recipient and downloads the results. Install the browser once with `npx playwright install chromium`.
+`npm run test:e2e` runs the Playwright end-to-end test. It starts the app against a separate `docseal_e2e` database on the same Postgres server, sets the site up as its first visitor, signs up a sender, sends a PDF, signs it as the recipient and downloads the results. Install the browser once with `npx playwright install chromium`.
 
 ## Project structure
 

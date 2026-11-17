@@ -1,7 +1,7 @@
 # Third-Party Notices
 
-SignuDoc includes bundled third-party assets that remain under their own
-licenses. The project license applies to SignuDoc's code, but it does not
+DocSeal includes bundled third-party assets that remain under their own
+licenses. The project license applies to DocSeal's code, but it does not
 replace the licenses for redistributed third-party files.
 
 ## Bundled third-party assets

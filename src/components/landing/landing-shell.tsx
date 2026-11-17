@@ -51,24 +51,24 @@ const workflowSteps: readonly WorkflowStep[] = [
 
 type ComparisonRow = {
   feature: string;
-  signudoc: string | boolean;
+  docseal: string | boolean;
   docusign: string | boolean;
 };
 
 const comparisonRows: readonly ComparisonRow[] = [
-  { feature: "Price", signudoc: "Free forever", docusign: "$10–15/mo" },
-  { feature: "Envelopes per month", signudoc: "Unlimited", docusign: "5" },
+  { feature: "Price", docseal: "Free forever", docusign: "$10–15/mo" },
+  { feature: "Envelopes per month", docseal: "Unlimited", docusign: "5" },
   {
     feature: "Signers per document",
-    signudoc: "Up to 10",
+    docseal: "Up to 10",
     docusign: "Varies by plan",
   },
-  { feature: "Reminders", signudoc: true, docusign: "Standard+ ($25+/mo)" },
+  { feature: "Reminders", docseal: true, docusign: "Standard+ ($25+/mo)" },
 ] as const;
 
 const faqItems: readonly FaqItem[] = [
   {
-    question: "Do signers need a SignuDoc account?",
+    question: "Do signers need a DocSeal account?",
     answer:
       "Nope. You sign in to send documents, but your signers just click a link and sign. No account, no friction.",
   },
@@ -382,7 +382,7 @@ function ComparisonTable() {
               <th className="w-[32%] rounded-t-2xl bg-(--accent-softer) px-5 py-4 text-center">
                 <span className="inline-flex items-center gap-2 text-[1.0625rem] font-extrabold tracking-[-0.02em] text-(--fg)">
                   <BrandMark className="size-6 rounded-[0.5rem]" />
-                  SignuDoc
+                  DocSeal
                 </span>
               </th>
               <th className="w-[32%] px-5 py-4 text-center">
@@ -404,7 +404,7 @@ function ComparisonTable() {
                     index === comparisonRows.length - 1 && "rounded-b-2xl",
                   )}
                 >
-                  <ComparisonValue advantage value={row.signudoc} />
+                  <ComparisonValue advantage value={row.docseal} />
                 </td>
                 <td className="border-t border-(--border) px-5 py-4 text-center text-(--secondary)">
                   <ComparisonValue value={row.docusign} />
@@ -424,8 +424,8 @@ function ComparisonTable() {
             </p>
             <ComparisonMobileRow
               advantage
-              label="SignuDoc"
-              value={row.signudoc}
+              label="DocSeal"
+              value={row.docseal}
             />
             <ComparisonMobileRow label="DocuSign" value={row.docusign} />
           </div>

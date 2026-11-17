@@ -3,7 +3,7 @@ import { test } from "node:test";
 
 import type { Resend } from "resend";
 
-import { createEmailService } from "./email.ts";
+import { createEmailService, resolveEmailDriver } from "./email.ts";
 
 // What the Resend client is asked to do when the service turns a request
 // away for rate. Nothing here talks to Resend.
@@ -129,4 +129,93 @@ test("a batch turned away for rate is sent again too", async () => {
 
   assert.equal(deliveries[0]?.messageId, "email_1");
   assert.equal(requests(), 2);
+});
+
+// Mailgun: what is posted, and that a 429 is tried again. Nothing here
+// talks to Mailgun.
+test("Mailgun gets the message as a form, and a 429 is tried again", async () => {
+  const requests: { body: FormData; headers: HeadersInit; url: string }[] = [];
+  const waits: number[] = [];
+  const answers = [
+    new Response("{}", { headers: { "retry-after": "2" }, status: 429 }),
+    Response.json({ id: "<mg-1@example.test>", message: "Queued" }),
+  ];
+  const env = {
+    MAILGUN_API_BASE: "https://api.eu.mailgun.net/",
+    MAILGUN_API_KEY: "key-test",
+    MAILGUN_DOMAIN: "Mail.Example.test",
+  };
+
+  assert.equal(resolveEmailDriver(env), "mailgun");
+  assert.equal(
+    resolveEmailDriver({ ...env, RESEND_API_KEY: "re_test" }),
+    "resend",
+  );
+
+  const service = createEmailService({
+    env,
+    fetchImpl: (url, init) => {
+      requests.push({
+        body: init!.body as FormData,
+        headers: init!.headers!,
+        url: String(url),
+      });
+      return Promise.resolve(answers.shift()!);
+    },
+    resolveAddresses: () =>
+      Promise.resolve({
+        senderAddress: "Acme <sign@mail.example.test>",
+        supportAddress: "help@example.test",
+      }),
+    wait: (milliseconds) => {
+      waits.push(milliseconds);
+      return Promise.resolve();
+    },
+  });
+
+  const result = await service.send({
+    ...MESSAGE,
+    attachments: [
+      {
+        content: new Uint8Array([1, 2, 3]),
+        contentType: "application/pdf",
+        filename: "signed.pdf",
+      },
+    ],
+  });
+
+  assert.equal(result.messageId, "<mg-1@example.test>");
+  assert.deepEqual(waits, [2000]);
+  assert.equal(requests.length, 2);
+  assert.equal(
+    requests[1]!.url,
+    "https://api.eu.mailgun.net/v3/mail.example.test/messages",
+  );
+  assert.deepEqual(requests[1]!.headers, {
+    authorization: `Basic ${Buffer.from("api:key-test").toString("base64")}`,
+  });
+  const form = requests[1]!.body;
+  assert.equal(form.get("from"), "Acme <sign@mail.example.test>");
+  assert.equal(form.get("to"), MESSAGE.to);
+  assert.equal(form.get("h:Reply-To"), "help@example.test");
+  assert.equal(form.get("o:tag"), MESSAGE.template);
+  assert.equal((form.get("attachment") as File).name, "signed.pdf");
+});
+
+test("a Mailgun error is raised with Mailgun's reason", async () => {
+  const service = createEmailService({
+    env: { MAILGUN_API_KEY: "key-test", MAILGUN_DOMAIN: "example.test" },
+    fetchImpl: () =>
+      Promise.resolve(Response.json({ message: "Forbidden" }, { status: 401 })),
+    resolveAddresses: () =>
+      Promise.resolve({
+        senderAddress: "Acme <sign@example.test>",
+        supportAddress: null,
+      }),
+  });
+
+  await assert.rejects(
+    service.send(MESSAGE),
+    /Mailgun refused the email \(401\): Forbidden/,
+  );
 });

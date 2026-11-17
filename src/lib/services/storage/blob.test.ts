@@ -185,7 +185,7 @@ test("a write that fails with nothing stored is still a failure", async () => {
 });
 
 test("the local store keeps the first object too, and keeps it whole", async () => {
-  const rootDir = await mkdtemp(path.join(tmpdir(), "signudoc-storage-"));
+  const rootDir = await mkdtemp(path.join(tmpdir(), "docseal-storage-"));
 
   try {
     const storage = createLocalStorageService({ rootDir });

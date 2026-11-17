@@ -34,12 +34,12 @@ type MemoryEntry = {
 };
 
 declare global {
-  var __signudocRateLimitStore: Map<string, MemoryEntry> | undefined;
-  var __signudocRateLimitSweepAt: number | undefined;
-  var __signudocRateLimitWarnedAt: number | undefined;
+  var __docsealRateLimitStore: Map<string, MemoryEntry> | undefined;
+  var __docsealRateLimitSweepAt: number | undefined;
+  var __docsealRateLimitWarnedAt: number | undefined;
 }
 
-const memoryStore = (globalThis.__signudocRateLimitStore ??= new Map<
+const memoryStore = (globalThis.__docsealRateLimitStore ??= new Map<
   string,
   MemoryEntry
 >());
@@ -69,7 +69,7 @@ function toDecision(
 }
 
 function sweepMemoryStore(now: number) {
-  if ((globalThis.__signudocRateLimitSweepAt ?? 0) > now) {
+  if ((globalThis.__docsealRateLimitSweepAt ?? 0) > now) {
     return;
   }
 
@@ -79,7 +79,7 @@ function sweepMemoryStore(now: number) {
     }
   }
 
-  globalThis.__signudocRateLimitSweepAt = now + MEMORY_SWEEP_INTERVAL_MS;
+  globalThis.__docsealRateLimitSweepAt = now + MEMORY_SWEEP_INTERVAL_MS;
 }
 
 /** The same counting as the database does, for one instance only. */
@@ -104,11 +104,11 @@ export function consumeRateLimitInMemory(
 function warnAboutFallback(error: unknown) {
   const now = Date.now();
 
-  if ((globalThis.__signudocRateLimitWarnedAt ?? 0) > now) {
+  if ((globalThis.__docsealRateLimitWarnedAt ?? 0) > now) {
     return;
   }
 
-  globalThis.__signudocRateLimitWarnedAt = now + FALLBACK_WARNING_INTERVAL_MS;
+  globalThis.__docsealRateLimitWarnedAt = now + FALLBACK_WARNING_INTERVAL_MS;
   console.warn(
     "[rate-limit] Counting in memory because the database could not be used:",
     error instanceof Error ? error.message : error,
@@ -188,6 +188,6 @@ export async function consumeRateLimit(
 
 export function clearRateLimitStoreForTests() {
   memoryStore.clear();
-  globalThis.__signudocRateLimitSweepAt = undefined;
-  globalThis.__signudocRateLimitWarnedAt = undefined;
+  globalThis.__docsealRateLimitSweepAt = undefined;
+  globalThis.__docsealRateLimitWarnedAt = undefined;
 }

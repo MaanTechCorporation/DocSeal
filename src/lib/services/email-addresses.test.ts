@@ -56,21 +56,21 @@ test("characters that mean something in an email header are dropped from the nam
   );
 });
 
-test("an install with no name, and the hosted service, send as SignuDoc", () => {
+test("an install with no name, and the hosted service, send as DocSeal", () => {
   assert.equal(
     buildEmailAddresses({ ...base, organizationName: null }).senderAddress,
-    "SignuDoc <onboarding@resend.dev>",
+    "DocSeal <onboarding@resend.dev>",
   );
   assert.equal(
     buildEmailAddresses({ ...base, hosted: true }).senderAddress,
-    "SignuDoc <onboarding@resend.dev>",
+    "DocSeal <onboarding@resend.dev>",
   );
 });
 
 test("the capture driver's fallback address is used when one is given", () => {
   assert.equal(
-    buildEmailAddresses(base, "dev@signudoc.localhost").senderAddress,
-    "Acme Corp <dev@signudoc.localhost>",
+    buildEmailAddresses(base, "dev@docseal.localhost").senderAddress,
+    "Acme Corp <dev@docseal.localhost>",
   );
 });
 

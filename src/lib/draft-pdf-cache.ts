@@ -1,4 +1,4 @@
-const DRAFT_PDF_CACHE_DB_NAME = "signudoc-draft-preview-cache";
+const DRAFT_PDF_CACHE_DB_NAME = "docseal-draft-preview-cache";
 const DRAFT_PDF_CACHE_DB_VERSION = 1;
 const DRAFT_PDF_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const DRAFT_PDF_CACHE_STORE_NAME = "draftPdfs";
@@ -27,9 +27,7 @@ async function openDraftPdfCacheDatabase(): Promise<IDBDatabase | null> {
     );
 
     request.onerror = () => {
-      reject(
-        request.error ?? new Error("Unable to open the draft PDF cache."),
-      );
+      reject(request.error ?? new Error("Unable to open the draft PDF cache."));
     };
 
     request.onupgradeneeded = () => {
@@ -63,7 +61,8 @@ function runDraftPdfCacheTransaction<T>(
 
     request.onerror = () => {
       reject(
-        request.error ?? new Error("Unable to complete the draft PDF cache request."),
+        request.error ??
+          new Error("Unable to complete the draft PDF cache request."),
       );
     };
 
@@ -128,9 +127,7 @@ export async function getCachedDraftPdfBlob(
   return record.blob;
 }
 
-async function deleteCachedDraftPdfBlob(
-  envelopeId: string,
-): Promise<void> {
+async function deleteCachedDraftPdfBlob(envelopeId: string): Promise<void> {
   const database = await openDraftPdfCacheDatabase();
 
   if (!database) {

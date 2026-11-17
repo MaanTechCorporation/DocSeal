@@ -26,7 +26,7 @@ const createdUsers: string[] = [];
 
 before(async () => {
   database = await openTestDatabase();
-  storageDir = await mkdtemp(path.join(tmpdir(), "signudoc-purge-"));
+  storageDir = await mkdtemp(path.join(tmpdir(), "docseal-purge-"));
   storageService = createStorageService({
     env: { STORAGE_DRIVER: "local", STORAGE_LOCAL_DIR: storageDir },
   });
