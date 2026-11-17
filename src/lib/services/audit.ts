@@ -5,11 +5,13 @@ import {
   type AuditEventRecord,
 } from "../schemas/envelope.ts";
 import {
+  afterCommit,
   type DbExecutor,
   getDb,
   queryMany,
   withTransaction,
 } from "../db/connection.ts";
+import { logAuditRecord } from "../security/logging.ts";
 import { canonicalJson } from "../utils/canonical-json.ts";
 
 export type AuditEventMetadata = Record<string, unknown> | null;
@@ -218,6 +220,7 @@ async function insertChainedAuditEvent(
     sequence,
     userAgent: input.userAgent ?? null,
   };
+  const rowHash = computeAuditRowHash(previousHash, fields);
 
   await database.query(
     `
@@ -248,9 +251,13 @@ async function insertChainedAuditEvent(
       createdAt,
       sequence,
       previousHash,
-      computeAuditRowHash(previousHash, fields),
+      rowHash,
     ],
   );
+
+  afterCommit(database, () => {
+    logAuditRecord({ ...fields, rowHash, trail: "envelope" });
+  });
 
   return auditEventRecordSchema.parse({
     actorEmail: fields.actorEmail,
