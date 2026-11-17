@@ -29,8 +29,8 @@ test("the button copies this repository and pre-fills its name", () => {
     link.searchParams.get("repository-url"),
     "https://github.com/NYLLON-SOFTWARE/SignuDoc",
   );
-  assert.equal(link.searchParams.get("project-name"), "signudoc");
-  assert.equal(link.searchParams.get("repository-name"), "signudoc");
+  assert.equal(link.searchParams.get("project-name"), "docseal");
+  assert.equal(link.searchParams.get("repository-name"), "docseal");
 });
 
 test("the button creates the database, the private file store and email", () => {

@@ -18,7 +18,7 @@ function release(overrides: Record<string, unknown> = {}) {
     body: "## Added\n- Update checks",
     draft: false,
     html_url: "https://github.com/NYLLON-SOFTWARE/SignuDoc/releases/tag/v0.2.0",
-    name: "SignuDoc 0.2.0",
+    name: "DocSeal 0.2.0",
     prerelease: false,
     published_at: "2026-11-15T10:00:00Z",
     tag_name: "v0.2.0",
@@ -46,7 +46,7 @@ test("versions compare by number, and a pre-release comes first", () => {
 
 test("the running version and commit come from the build", () => {
   assert.equal(
-    getRunningVersion({ NEXT_PUBLIC_SIGNUDOC_VERSION: "0.2.0" }),
+    getRunningVersion({ NEXT_PUBLIC_DOCSEAL_VERSION: "0.2.0" }),
     "0.2.0",
   );
   assert.equal(getRunningVersion({}), "0.0.0");
@@ -65,19 +65,19 @@ test("the deploy repository comes from Vercel's git variables", () => {
     VERCEL_GIT_COMMIT_REF: "main",
     VERCEL_GIT_PROVIDER: "github",
     VERCEL_GIT_REPO_OWNER: "acme",
-    VERCEL_GIT_REPO_SLUG: "signudoc",
+    VERCEL_GIT_REPO_SLUG: "docseal",
   });
 
   assert.deepEqual(repository, {
     actionsUrl:
-      "https://github.com/acme/signudoc/actions/workflows/update-signudoc.yml",
+      "https://github.com/acme/docseal/actions/workflows/update-signudoc.yml",
     addWorkflowUrl:
-      "https://github.com/acme/signudoc/new/main?filename=.github%2Fworkflows%2Fupdate-signudoc.yml",
+      "https://github.com/acme/docseal/new/main?filename=.github%2Fworkflows%2Fupdate-signudoc.yml",
     branch: "main",
     isUpstream: false,
     owner: "acme",
-    slug: "signudoc",
-    url: "https://github.com/acme/signudoc",
+    slug: "docseal",
+    url: "https://github.com/acme/docseal",
   });
 });
 
@@ -87,7 +87,7 @@ test("no deploy repository off GitHub, or with odd names", () => {
     getDeployRepository({
       VERCEL_GIT_PROVIDER: "gitlab",
       VERCEL_GIT_REPO_OWNER: "acme",
-      VERCEL_GIT_REPO_SLUG: "signudoc",
+      VERCEL_GIT_REPO_SLUG: "docseal",
     }),
     null,
   );
@@ -95,7 +95,7 @@ test("no deploy repository off GitHub, or with odd names", () => {
     getDeployRepository({
       VERCEL_GIT_PROVIDER: "github",
       VERCEL_GIT_REPO_OWNER: "acme/../x",
-      VERCEL_GIT_REPO_SLUG: "signudoc",
+      VERCEL_GIT_REPO_SLUG: "docseal",
     }),
     null,
   );
@@ -116,7 +116,7 @@ test("a preview deployment still points at main, and upstream is recognised", ()
 
 test("release info is read from GitHub's answer", () => {
   assert.deepEqual(toReleaseInfo(release()), {
-    name: "SignuDoc 0.2.0",
+    name: "DocSeal 0.2.0",
     notes: "## Added\n- Update checks",
     publishedAt: "2026-11-15T10:00:00Z",
     url: "https://github.com/NYLLON-SOFTWARE/SignuDoc/releases/tag/v0.2.0",

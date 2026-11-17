@@ -42,13 +42,13 @@ jobs:
       postgres:
         image: postgres:17
         env:
-          POSTGRES_USER: signudoc
-          POSTGRES_PASSWORD: signudoc
-          POSTGRES_DB: signudoc_e2e
+          POSTGRES_USER: docseal
+          POSTGRES_PASSWORD: docseal
+          POSTGRES_DB: docseal_e2e
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U signudoc -d signudoc_e2e"
+          --health-cmd "pg_isready -U docseal -d docseal_e2e"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
@@ -63,11 +63,11 @@ jobs:
       # the cleanup job's lock.
       - run: npm run test:db
         env:
-          E2E_DATABASE_URL: postgres://signudoc:signudoc@127.0.0.1:5432/signudoc_e2e
+          E2E_DATABASE_URL: postgres://docseal:docseal@127.0.0.1:5432/docseal_e2e
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
         env:
-          E2E_DATABASE_URL: postgres://signudoc:signudoc@127.0.0.1:5432/signudoc_e2e
+          E2E_DATABASE_URL: postgres://docseal:docseal@127.0.0.1:5432/docseal_e2e
       - uses: actions/upload-artifact@v6
         if: failure()
         with:

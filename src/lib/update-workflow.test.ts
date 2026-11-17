@@ -13,7 +13,7 @@ import path from "node:path";
 import { after, test } from "node:test";
 
 // Runs the two shell steps of .github/workflows/update-signudoc.yml against
-// throwaway repositories: a pretend SignuDoc with two releases, and a copy
+// throwaway repositories: a pretend DocSeal with two releases, and a copy
 // made the way the Vercel Deploy button makes one (a single commit holding
 // the files of the first release, with none of its history). `gh` is a
 // stub that answers the release questions and records the pull request.
@@ -94,7 +94,7 @@ function write(dir: string, file: string, content: string) {
 
 let counter = 0;
 
-/** A pretend SignuDoc: v0.1.0, then v0.2.0 with a migration and CI change. */
+/** A pretend DocSeal: v0.1.0, then v0.2.0 with a migration and CI change. */
 function makeUpstream() {
   const dir = path.join(scratch, `upstream-${String((counter += 1))}`);
 
@@ -180,7 +180,7 @@ case "$1 $2" in
     git -C "${upstream}" rev-parse -q --verify "refs/tags/$tag" > /dev/null || exit 1
     release "$tag" ;;
   "pr list") echo "" ;;
-  "pr create") echo "https://github.com/acme/signudoc/pull/1" ;;
+  "pr create") echo "https://github.com/acme/docseal/pull/1" ;;
   *) echo "unexpected gh $*" >&2; exit 2 ;;
 esac
 `,
@@ -220,7 +220,7 @@ function runUpdate(
     BASE_BRANCH: "main",
     BASED_ON: options.basedOn ?? "",
     GITHUB_OUTPUT: outputFile,
-    GITHUB_REPOSITORY: "acme/signudoc",
+    GITHUB_REPOSITORY: "acme/docseal",
     GITHUB_SERVER_URL: "https://github.com",
     GITHUB_STEP_SUMMARY: summaryFile,
     HAS_UPDATE_TOKEN: options.hasToken ? "true" : "false",
@@ -304,9 +304,9 @@ test("a Deploy-button copy gets a pull request with the new release", () => {
   // The commit names the release, so the next run knows where it stands.
   assert.match(
     git(origin, "log", "-1", "--format=%B", "signudoc-update/v0.2.0"),
-    new RegExp(`SignuDoc-Commit: ${git(upstream, "rev-parse", "v0.2.0")}`),
+    new RegExp(`DocSeal-Commit: ${git(upstream, "rev-parse", "v0.2.0")}`),
   );
-  // One new commit on top of the copy, none of SignuDoc's own history.
+  // One new commit on top of the copy, none of DocSeal's own history.
   assert.equal(
     git(origin, "rev-list", "--count", "signudoc-update/v0.2.0"),
     "2",
@@ -317,7 +317,7 @@ test("a Deploy-button copy gets a pull request with the new release", () => {
   );
   assert.match(
     result.summary,
-    /Opened https:\/\/github\.com\/acme\/signudoc\/pull\/1/,
+    /Opened https:\/\/github\.com\/acme\/docseal\/pull\/1/,
   );
 });
 
@@ -415,7 +415,7 @@ function squashMerge(origin: string, branch: string) {
   const message = git(dir, "log", "-1", "--format=%B", `origin/${branch}`);
 
   git(dir, "merge", "--quiet", "--squash", `origin/${branch}`);
-  git(dir, "commit", "--quiet", "-m", `Update SignuDoc (#1)\n\n* ${message}`);
+  git(dir, "commit", "--quiet", "-m", `Update DocSeal (#1)\n\n* ${message}`);
   git(dir, "push", "--quiet", "origin", "main");
   // GitHub keeps the branch unless the repository deletes merged branches.
 }
@@ -431,7 +431,7 @@ test("once the pull request is merged, the next run is up to date", () => {
 
   assert.equal(again.status, 0, again.stderr);
   assert.equal(again.output.branch, undefined);
-  assert.match(again.summary, /Already up to date with SignuDoc v0\.2\.0/);
+  assert.match(again.summary, /Already up to date with DocSeal v0\.2\.0/);
   // The workflow file it left alone is still pointed out.
   assert.match(again.summary, /SIGNUDOC_UPDATE_TOKEN/);
 });
@@ -514,7 +514,7 @@ test("workflow files left behind do not block the next release", () => {
 });
 
 test("an unclear starting point stops, and based_on settles it", () => {
-  // Two SignuDoc commits equally far from the copy's edited first commit.
+  // Two DocSeal commits equally far from the copy's edited first commit.
   const upstream = path.join(scratch, `upstream-${String((counter += 1))}`);
 
   mkdirSync(upstream);
@@ -541,7 +541,7 @@ test("an unclear starting point stops, and based_on settles it", () => {
   const settled = runUpdate(checkout(origin), upstream, { basedOn: "0.1.0" });
 
   assert.equal(settled.status, 1);
-  // From v0.1.0, SignuDoc changed the line this copy changed too.
+  // From v0.1.0, DocSeal changed the line this copy changed too.
   assert.match(settled.summary, /- `src\/app\.ts`/);
 
   const wrong = runUpdate(checkout(origin), upstream, { basedOn: "v9.9.9" });
@@ -556,7 +556,7 @@ test("a copy that is already on the latest release is up to date", () => {
   const result = runUpdate(checkout(origin), upstream, { version: "0.1.0" });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.summary, /Already up to date with SignuDoc v0\.1\.0/);
+  assert.match(result.summary, /Already up to date with DocSeal v0\.1\.0/);
 });
 
 test("merge-now pushes straight to the production branch", () => {

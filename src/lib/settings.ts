@@ -168,12 +168,12 @@ type SettingsCache = {
 };
 
 declare global {
-  var __signudocSettingsCache: SettingsCache | undefined;
+  var __docsealSettingsCache: SettingsCache | undefined;
 }
 
 // Kept on globalThis, like the rate limit store, so every copy of this
 // module in one process shares it and a change clears it for all of them.
-const cache: SettingsCache = (globalThis.__signudocSettingsCache ??= {
+const cache: SettingsCache = (globalThis.__docsealSettingsCache ??= {
   settings: null,
   setupCompleteUntil: 0,
 });

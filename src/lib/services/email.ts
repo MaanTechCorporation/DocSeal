@@ -6,7 +6,12 @@ import { Resend } from "resend";
 
 import { getSettings } from "../settings.ts";
 import { type EmailTemplateKind } from "../types/domain.ts";
-import { getEnv, isLocalDeployment, type EnvSource } from "../utils/env.ts";
+import {
+  getEnv,
+  isLocalDeployment,
+  readEnv,
+  type EnvSource,
+} from "../utils/env.ts";
 import { buildEmailAddresses, type EmailAddresses } from "./email-addresses.ts";
 import { assertServiceConfig } from "./service-config.ts";
 
@@ -16,9 +21,46 @@ import { assertServiceConfig } from "./service-config.ts";
 const EMAIL_ENV_KEYS = ["RESEND_API_KEY"] as const;
 
 const DEFAULT_CAPTURE_DIR = ".data/outbox";
-const DEFAULT_CAPTURE_SENDER_ADDRESS = "dev@signudoc.localhost";
+const DEFAULT_CAPTURE_SENDER_ADDRESS = "dev@docseal.localhost";
 
-export type EmailDriver = "capture" | "resend";
+export type EmailDriver = "capture" | "mailgun" | "resend";
+
+const DEFAULT_MAILGUN_API_BASE = "https://api.mailgun.net";
+
+export type MailgunConfig = { apiBase: string; apiKey: string; domain: string };
+
+/** MAILGUN_API_KEY and MAILGUN_DOMAIN, or null when either is missing. */
+export function getMailgunConfig(env: EnvSource): MailgunConfig | null {
+  const apiKey = readEnv(env, "MAILGUN_API_KEY");
+  const domain = readEnv(env, "MAILGUN_DOMAIN")?.toLowerCase();
+
+  if (!apiKey || !domain) {
+    return null;
+  }
+
+  return {
+    // MAILGUN_API_BASE=https://api.eu.mailgun.net for an EU-region domain.
+    apiBase: (
+      readEnv(env, "MAILGUN_API_BASE") ?? DEFAULT_MAILGUN_API_BASE
+    ).replace(/\/+$/, ""),
+    apiKey,
+    domain,
+  };
+}
+
+export function mailgunFetch(
+  config: MailgunConfig,
+  pathname: string,
+  init: RequestInit = {},
+  fetchImpl: typeof fetch = fetch,
+): Promise<Response> {
+  return fetchImpl(`${config.apiBase}${pathname}`, {
+    ...init,
+    headers: {
+      authorization: `Basic ${Buffer.from(`api:${config.apiKey}`).toString("base64")}`,
+    },
+  });
+}
 
 export type EmailAttachment = {
   content: Uint8Array;
@@ -68,6 +110,8 @@ type CreateEmailServiceOptions = {
   /** Replaced in tests, where there is no database to read settings from. */
   resolveAddresses?: () => Promise<EmailAddresses>;
   resendClient?: Resend;
+  /** Replaced in tests of the Mailgun driver. */
+  fetchImpl?: typeof fetch;
   /** Replaced in tests, so that they do not really wait. */
   wait?: (milliseconds: number) => Promise<void>;
 };
@@ -186,15 +230,22 @@ export function resolveEmailDriver(env: EnvSource = process.env): EmailDriver {
   const configuredDriver = env.EMAIL_DRIVER?.trim().toLowerCase();
 
   if (!configuredDriver) {
-    return "resend";
+    // Mailgun keys and no Resend key: Mailgun is what was meant.
+    return readEnv(env, "MAILGUN_API_KEY") && !readEnv(env, "RESEND_API_KEY")
+      ? "mailgun"
+      : "resend";
   }
 
-  if (configuredDriver === "capture" || configuredDriver === "resend") {
+  if (
+    configuredDriver === "capture" ||
+    configuredDriver === "mailgun" ||
+    configuredDriver === "resend"
+  ) {
     return configuredDriver;
   }
 
   throw new Error(
-    `Unknown EMAIL_DRIVER "${configuredDriver}". Use "resend" or "capture".`,
+    `Unknown EMAIL_DRIVER "${configuredDriver}". Use "resend", "mailgun" or "capture".`,
   );
 }
 
@@ -285,14 +336,107 @@ function createCaptureEmailService(
   };
 }
 
+/**
+ * Sends through Mailgun's HTTP API. Mailgun takes no idempotency key, so a
+ * retried send can deliver twice; Resend's driver does not have that gap.
+ */
+function createMailgunEmailService(
+  env: EnvSource,
+  resolveAddresses: () => Promise<EmailAddresses>,
+  fetchImpl: typeof fetch,
+  wait: (milliseconds: number) => Promise<void>,
+): EmailService {
+  const config = getMailgunConfig(env);
+
+  if (!config) {
+    assertServiceConfig("email", ["MAILGUN_API_KEY", "MAILGUN_DOMAIN"], env);
+  }
+
+  const mailgun = config!;
+
+  async function send(
+    message: TransactionalEmailMessage,
+  ): Promise<EmailDeliveryResult> {
+    const addresses = await resolveAddresses();
+    const form = new FormData();
+    const replyTo = message.replyTo ?? addresses.supportAddress;
+
+    form.append("from", addresses.senderAddress);
+    form.append("to", message.to);
+    form.append("subject", message.subject);
+    form.append("text", message.textBody);
+    if (message.htmlBody) form.append("html", message.htmlBody);
+    if (replyTo) form.append("h:Reply-To", replyTo);
+    form.append("o:tag", message.template);
+    for (const attachment of message.attachments ?? []) {
+      form.append(
+        "attachment",
+        new Blob([attachment.content.slice()], {
+          type: attachment.contentType,
+        }),
+        attachment.filename,
+      );
+    }
+
+    // A 429 is Mailgun turning a burst away; it is tried again like Resend's.
+    for (let attempt = 0; ; attempt += 1) {
+      const response = await mailgunFetch(
+        mailgun,
+        `/v3/${encodeURIComponent(mailgun.domain)}/messages`,
+        { body: form, method: "POST" },
+        fetchImpl,
+      );
+
+      if (response.status === 429 && attempt < RATE_LIMIT_RETRIES) {
+        await wait(rateLimitWaitMs(Object.fromEntries(response.headers)));
+        continue;
+      }
+
+      const body = (await response.json().catch(() => ({}))) as {
+        id?: string;
+        message?: string;
+      };
+
+      if (!response.ok) {
+        throw new Error(
+          `Mailgun refused the email (${String(response.status)}): ${body.message ?? response.statusText}`,
+        );
+      }
+
+      return { accepted: [message.to], messageId: body.id, rejected: [] };
+    }
+  }
+
+  return {
+    send: (message) => send(message),
+    async sendBatch(messages) {
+      const results: EmailDeliveryResult[] = [];
+
+      for (const message of messages) {
+        results.push(await send(message));
+      }
+
+      return results;
+    },
+  };
+}
+
 /** The addresses this install sends from, as configured right now. */
 export async function resolveEmailAddresses(
   env: EnvSource = process.env,
 ): Promise<EmailAddresses> {
   const settings = await getSettings(env);
 
-  return resolveEmailDriver(env) === "capture"
-    ? buildEmailAddresses(settings, DEFAULT_CAPTURE_SENDER_ADDRESS)
+  const driver = resolveEmailDriver(env);
+  const mailgunDomain = getMailgunConfig(env)?.domain;
+
+  if (driver === "capture") {
+    return buildEmailAddresses(settings, DEFAULT_CAPTURE_SENDER_ADDRESS);
+  }
+
+  // Mailgun has no shared test address; its own domain is the fallback.
+  return driver === "mailgun" && mailgunDomain
+    ? buildEmailAddresses(settings, `noreply@${mailgunDomain}`)
     : buildEmailAddresses(settings);
 }
 
@@ -300,10 +444,15 @@ export function createEmailService({
   env = process.env,
   resolveAddresses = () => resolveEmailAddresses(env),
   resendClient,
+  fetchImpl = fetch,
   wait = waitFor,
 }: CreateEmailServiceOptions = {}): EmailService {
   if (!resendClient && resolveEmailDriver(env) === "capture") {
     return createCaptureEmailService(env, resolveAddresses);
+  }
+
+  if (!resendClient && resolveEmailDriver(env) === "mailgun") {
+    return createMailgunEmailService(env, resolveAddresses, fetchImpl, wait);
   }
 
   if (!resendClient) {
