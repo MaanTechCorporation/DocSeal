@@ -155,7 +155,7 @@ test("updatePasswordSchema preserves surrounding spaces in both current and new 
   assert.equal(
     updatePasswordSchema.safeParse({
       currentPassword: PADDED_PASSWORD,
-      newPassword: "  too short  ",
+      newPassword: "  short  ",
     }).success,
     false,
   );
@@ -185,7 +185,7 @@ test("resetPasswordSchema preserves surrounding spaces and enforces length bound
     false,
   );
   assert.equal(
-    resetPasswordSchema.safeParse({ newPassword: "  too short  " }).success,
+    resetPasswordSchema.safeParse({ newPassword: "  short  " }).success,
     false,
   );
   assert.equal(

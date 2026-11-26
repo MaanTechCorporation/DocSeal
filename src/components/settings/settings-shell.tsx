@@ -19,6 +19,7 @@ import { Input } from "@/components/ui/input";
 import {
   describePasswordRefusal,
   newPasswordLengthError,
+  PASSWORD_MIN_LENGTH,
   PASSWORD_TOO_SHORT_MESSAGE,
 } from "@/lib/password-messages";
 import { updatePasswordSchema } from "@/lib/schemas/auth";
@@ -644,7 +645,7 @@ export function SettingsShell({
                   <FieldShell
                     disabled={isBusy}
                     error={passwordErrors.newPassword}
-                    helper="Must be at least 15 characters"
+                    helper={`Must be at least ${String(PASSWORD_MIN_LENGTH)} characters`}
                     label="New password"
                     name="newPassword"
                     onChange={handlePasswordChange("newPassword")}

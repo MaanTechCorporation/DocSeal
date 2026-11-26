@@ -16,6 +16,10 @@ import {
   type TransactionalEmailMessage,
 } from "../services/email.ts";
 import { withUserEmailLegalFooter } from "../services/email-legal-footer.ts";
+import {
+  PASSWORD_MAX_LENGTH,
+  PASSWORD_MIN_LENGTH,
+} from "../password-messages.ts";
 import { consumeRateLimit } from "../security/rate-limit.ts";
 import {
   getClientIpHeaderNames,
@@ -329,8 +333,10 @@ export function createAppAuth({
     ...(isPasswordBreachCheckEnabled(env)
       ? [
           haveIBeenPwned({
+            // The sign-up, password reset and settings pages look for
+            // "compromised" in this message to point at the password field.
             customPasswordCompromisedMessage:
-              "This password has appeared in a breach. Choose a different password.",
+              "This password is compromised: it has appeared in a breach. Choose a different password.",
           }),
         ]
       : []),
@@ -408,8 +414,8 @@ export function createAppAuth({
     },
     emailAndPassword: {
       enabled: true,
-      maxPasswordLength: 128,
-      minPasswordLength: 15,
+      maxPasswordLength: PASSWORD_MAX_LENGTH,
+      minPasswordLength: PASSWORD_MIN_LENGTH,
       requireEmailVerification: true,
       revokeSessionsOnPasswordReset: true,
       onPasswordReset: async ({ user }, request) => {

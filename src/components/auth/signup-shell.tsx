@@ -14,6 +14,7 @@ import { authClient } from "@/lib/auth/client";
 import {
   describePasswordRefusal,
   newPasswordLengthError,
+  PASSWORD_MIN_LENGTH,
   PASSWORD_TOO_SHORT_MESSAGE,
 } from "@/lib/password-messages";
 import { signUpSchema } from "@/lib/schemas/auth";
@@ -189,7 +190,7 @@ function SignupFormCard({
               autoComplete="new-password"
               disabled={formLocked}
               error={errors.password}
-              helper="Must be at least 15 characters"
+              helper={`Must be at least ${String(PASSWORD_MIN_LENGTH)} characters`}
               label="Password"
               name="signup-password"
               onChange={onPasswordChange}

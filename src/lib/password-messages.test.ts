@@ -15,9 +15,9 @@ test("a new password over 128 characters is told the maximum, not the minimum (i
   assert.equal(overLimit.length, 129);
   assert.equal(newPasswordLengthError(overLimit), PASSWORD_TOO_LONG_MESSAGE);
   assert.equal(newPasswordLengthError(overLimit.slice(0, 128)), null);
-  assert.equal(newPasswordLengthError("a".repeat(15)), null);
+  assert.equal(newPasswordLengthError("a".repeat(10)), null);
   assert.equal(
-    newPasswordLengthError("a".repeat(14)),
+    newPasswordLengthError("a".repeat(9)),
     PASSWORD_TOO_SHORT_MESSAGE,
   );
   assert.equal(newPasswordLengthError("  12345678901  "), null);

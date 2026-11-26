@@ -1,8 +1,8 @@
 // What a person is told about a password's length, the same on every form.
 // The limits match Better Auth's minPasswordLength and maxPasswordLength in
-// src/lib/auth/server.ts (15 to 128 characters).
+// src/lib/auth/server.ts (10 to 128 characters).
 
-export const PASSWORD_MIN_LENGTH = 15;
+export const PASSWORD_MIN_LENGTH = 10;
 export const PASSWORD_MAX_LENGTH = 128;
 
 export const PASSWORD_TOO_SHORT_MESSAGE = `Password must be at least ${PASSWORD_MIN_LENGTH} characters`;

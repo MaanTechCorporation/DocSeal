@@ -16,8 +16,8 @@ Use test documents only, and mark them as such.
 | Step | Action                                                                                                                        | Expected                                     |
 | ---- | ----------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
 | 1    | Sign up as Signer A with a 14-character password.                                                                             | Refused: too short.                          |
-| 2    | Sign up with a password of 15 or more characters that appears in public breach lists (check one on haveibeenpwned.com first). | Refused.                                     |
-| 3    | Sign up with a strong password of 15 or more characters, and confirm the email.                                               | Account created, and you can log in.         |
+| 2    | Sign up with a password of 10 or more characters that appears in public breach lists (check one on haveibeenpwned.com first). | Refused.                                     |
+| 3    | Sign up with a strong password of 10 or more characters, and confirm the email.                                               | Account created, and you can log in.         |
 | 4    | As Signer A, open `/settings`.                                                                                                | No Organization, People or Part 11 sections. |
 | 5    | Create Signer B the same way.                                                                                                 | Account created.                             |
 

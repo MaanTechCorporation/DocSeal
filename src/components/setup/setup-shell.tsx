@@ -15,6 +15,10 @@ import { Input } from "@/components/ui/input";
 import { authClient } from "@/lib/auth/client";
 import { cn } from "@/lib/cn";
 import {
+  PASSWORD_MAX_LENGTH,
+  PASSWORD_MIN_LENGTH,
+} from "@/lib/password-messages";
+import {
   buildSenderAddress,
   DEFAULT_SENDER_LOCAL_PART,
   DEFAULT_SENDING_SUBDOMAIN,
@@ -487,12 +491,12 @@ function SetupForm({
               autoComplete="new-password"
               disabled={isSubmitting}
               error={errors.password}
-              helper="15 to 128 characters. Let your password manager make one."
+              helper={`${String(PASSWORD_MIN_LENGTH)} to ${String(PASSWORD_MAX_LENGTH)} characters. Let your password manager make one.`}
               label="Password"
               // No maxLength: the browser would cut a longer password short
               // without a word, and the account would get a password other
               // than the one typed. Setup refuses one over 128 instead.
-              minLength={15}
+              minLength={PASSWORD_MIN_LENGTH}
               name="setup-password"
               passwordRules="minlength: 20; maxlength: 64; required: lower; required: upper; required: digit; allowed: [-_.!@#$%^&*];"
               onChange={handleChange("password")}
