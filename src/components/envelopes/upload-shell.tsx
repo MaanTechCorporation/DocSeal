@@ -23,8 +23,20 @@ import {
   renderPdfThumbnail,
   uploadEnvelopeThumbnail,
 } from "@/lib/pdf-thumbnail";
+import {
+  describePdfPreviewFailure,
+  PREVIEW_UNAVAILABLE_MESSAGE,
+} from "@/lib/pdf-preview-error";
 import { assertPdfPreviewRenderable } from "@/lib/pdfjs-client";
 import { type CreateEnvelopeResponse } from "@/lib/schemas/envelope";
+import {
+  classifyEnvelopeCreateFailure,
+  ENVELOPE_TITLE_LIMIT_REACHED_MESSAGE,
+  ENVELOPE_TITLE_MAX_LENGTH,
+  getEnvelopeTitleLengthError,
+  suggestEnvelopeTitle,
+  validateEnvelopeTitle,
+} from "@/lib/upload-validation";
 
 const envelopeSteps = ["Upload", "Signers", "Place fields", "Review"];
 const MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024;
@@ -39,15 +51,8 @@ type UploadSummary = {
 
 const errorMessageMap: Record<UploadErrorCode, string> = {
   "invalid-type": "Only PDF files are supported. Please upload a valid PDF.",
-  "preview-unavailable":
-    "We couldn't render this PDF in the editor. Please export it as a standard PDF and try again.",
+  "preview-unavailable": PREVIEW_UNAVAILABLE_MESSAGE,
   "too-large": "This file exceeds the 20 MB limit.",
-};
-
-const knownTitleSuggestions: Record<string, string> = {
-  "nda-clientbravo-2026.pdf": "NDA - Client Bravo",
-  "nda-client-bravo-2026.pdf": "NDA - Client Bravo",
-  "vendor-agreement-two-signer.pdf": "Vendor agreement - two signer flow",
 };
 
 function formatFileSize(sizeInBytes: number) {
@@ -58,26 +63,6 @@ function formatFileSize(sizeInBytes: number) {
   }
 
   return `${Math.max(1, Math.round(sizeInBytes / 1024))} KB`;
-}
-
-function makeTitleSuggestion(fileName: string) {
-  return fileName
-    .replace(/\.pdf$/i, "")
-    .replace(/([a-z])([A-Z])/g, "$1 $2")
-    .replace(/[_-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function getTitleSuggestion(fileName: string): string {
-  const normalizedName = fileName.toLowerCase();
-  const knownTitleSuggestion = knownTitleSuggestions[normalizedName];
-
-  if (knownTitleSuggestion) {
-    return knownTitleSuggestion;
-  }
-
-  return makeTitleSuggestion(fileName);
 }
 
 function isClientVisiblePdf(file: File): boolean {
@@ -103,6 +88,8 @@ function UploadShellLayout({
   previewUrl,
   summary,
   title,
+  titleError,
+  titleHelper,
 }: {
   canContinue: boolean;
   errorMessage: string | null;
@@ -117,6 +104,8 @@ function UploadShellLayout({
   previewUrl: string | null;
   summary: UploadSummary | null;
   title: string;
+  titleError: string | null;
+  titleHelper: string | null;
 }) {
   const dropzoneClasses = isBusy
     ? "border-(--accent) bg-(--accent-softer)"
@@ -147,7 +136,12 @@ function UploadShellLayout({
       >
         <div className="space-y-6">
           <FieldShell
+            disabled={isBusy}
+            error={titleError ?? undefined}
+            helper={titleHelper ?? undefined}
             label="Envelope title"
+            maxLength={ENVELOPE_TITLE_MAX_LENGTH}
+            name="envelope-title"
             onChange={onTitleChange}
             placeholder="e.g., NDA - Client Bravo"
             readOnly={false}
@@ -330,6 +324,7 @@ export function UploadShell({ directUploadPrefix = null }: UploadShellProps) {
   const [title, setTitle] = useState("");
   const [summary, setSummary] = useState<UploadSummary | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [serverTitleError, setServerTitleError] = useState<string | null>(null);
   const [isCreatingDraft, setIsCreatingDraft] = useState(false);
   const [autoFilledTitle, setAutoFilledTitle] = useState<string | null>(null);
   const [isDragActive, setIsDragActive] = useState(false);
@@ -423,7 +418,7 @@ export function UploadShell({ directUploadPrefix = null }: UploadShellProps) {
 
     startThumbnail(file);
 
-    const titleSuggestion = getTitleSuggestion(file.name);
+    const titleSuggestion = suggestEnvelopeTitle(file.name);
 
     setSummary({
       file,
@@ -435,6 +430,7 @@ export function UploadShell({ directUploadPrefix = null }: UploadShellProps) {
     if (title.trim().length === 0) {
       setTitle(titleSuggestion);
       setAutoFilledTitle(titleSuggestion);
+      setServerTitleError(null);
     }
   }
 
@@ -461,6 +457,7 @@ export function UploadShell({ directUploadPrefix = null }: UploadShellProps) {
   function handleTitleChange(event: ChangeEvent<HTMLInputElement>) {
     const nextTitle = event.target.value;
     setTitle(nextTitle);
+    setServerTitleError(null);
 
     if (autoFilledTitle && nextTitle !== autoFilledTitle) {
       setAutoFilledTitle(null);
@@ -483,12 +480,20 @@ export function UploadShell({ directUploadPrefix = null }: UploadShellProps) {
   }
 
   async function handleContinue() {
-    if (isCreatingDraft || !summary || title.trim().length === 0) {
+    if (isCreatingDraft || !summary) {
+      return;
+    }
+
+    const clientTitleError = validateEnvelopeTitle(title);
+
+    if (clientTitleError) {
+      setServerTitleError(clientTitleError);
       return;
     }
 
     setIsCreatingDraft(true);
     setErrorMessage(null);
+    setServerTitleError(null);
 
     // Taken now, with the file. The file can still be removed and another
     // chosen while the draft is being created, and that one's picture must
@@ -503,7 +508,7 @@ export function UploadShell({ directUploadPrefix = null }: UploadShellProps) {
           "Failed to validate the PDF preview before draft creation.",
           error,
         );
-        setErrorMessage(errorMessageMap["preview-unavailable"]);
+        setErrorMessage(describePdfPreviewFailure(error));
         setIsCreatingDraft(false);
         return;
       }
@@ -518,11 +523,18 @@ export function UploadShell({ directUploadPrefix = null }: UploadShellProps) {
       const payload = await parseResponse<CreateEnvelopeResponse>(response);
 
       if (!payload.data || payload.error) {
-        setErrorMessage(
-          payload.error ?? "Something went wrong. Please try again.",
-        );
+        const failure = classifyEnvelopeCreateFailure({
+          error: payload.error,
+          status: response.status,
+        });
 
-        if (response.status === 400) {
+        if (failure.target === "title") {
+          setServerTitleError(failure.message);
+        } else {
+          setErrorMessage(failure.message);
+        }
+
+        if (failure.clearSelectedFile) {
           setSummary(null);
           startThumbnail(null);
         }
@@ -560,8 +572,15 @@ export function UploadShell({ directUploadPrefix = null }: UploadShellProps) {
     }
   }
 
+  const titleError = getEnvelopeTitleLengthError(title) ?? serverTitleError;
+  const titleHelper =
+    !titleError && title.length >= ENVELOPE_TITLE_MAX_LENGTH
+      ? ENVELOPE_TITLE_LIMIT_REACHED_MESSAGE
+      : null;
   const canContinue =
-    !isCreatingDraft && summary != null && title.trim().length > 0;
+    !isCreatingDraft &&
+    summary != null &&
+    validateEnvelopeTitle(title) === null;
 
   return (
     <div
@@ -604,6 +623,8 @@ export function UploadShell({ directUploadPrefix = null }: UploadShellProps) {
         previewUrl={previewUrl}
         summary={summary}
         title={title}
+        titleError={titleError}
+        titleHelper={titleHelper}
       />
     </div>
   );

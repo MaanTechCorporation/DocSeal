@@ -93,6 +93,65 @@ test("choices are read one per line, without blanks or repeats", () => {
   assert.equal(parseOptionLines("x".repeat(200))[0].length, 80);
 });
 
+test("choices truncate on whole-character boundaries without splitting surrogate pairs", () => {
+  const eightyWithEmoji = `${"a".repeat(79)}😀`;
+  const eightyOneWithTrailingAscii = `${"a".repeat(79)}😀Z`;
+  const eightyOneWithTrailingEmoji = `${"a".repeat(80)}😀`;
+  const family = "👨‍👩‍👧"; // 5 code points in one grapheme cluster
+  const eightyWithFamily = `${"a".repeat(75)}${family}`;
+  const eightyOneWithFamily = `${"a".repeat(76)}${family}`;
+  const heart = "❤️"; // 2 code points (U+2764 U+FE0F)
+  const flag = "🇺🇸"; // 2 regional-indicator code points
+
+  // 80 code points ending in an astral emoji (81 UTF-16 code units) stays intact.
+  const kept = parseOptionLines(eightyWithEmoji);
+  assert.deepEqual(kept, [eightyWithEmoji]);
+  assert.equal(kept[0].isWellFormed(), true);
+
+  // 81 code points keeps the emoji at code point 80 and drops the 81st.
+  const trimmedAfterEmoji = parseOptionLines(eightyOneWithTrailingAscii);
+  assert.deepEqual(trimmedAfterEmoji, [eightyWithEmoji]);
+  assert.equal(trimmedAfterEmoji[0].isWellFormed(), true);
+
+  // 80 ASCII chars followed by an emoji drops the emoji cleanly.
+  const droppedEmoji = parseOptionLines(eightyOneWithTrailingEmoji);
+  assert.deepEqual(droppedEmoji, ["a".repeat(80)]);
+  assert.equal(droppedEmoji[0].isWellFormed(), true);
+
+  // Multi-code-point grapheme clusters stay whole or are dropped together.
+  assert.deepEqual(parseOptionLines(eightyWithFamily), [eightyWithFamily]);
+  assert.deepEqual(parseOptionLines(`${eightyWithFamily}Z`), [
+    eightyWithFamily,
+  ]);
+  assert.deepEqual(parseOptionLines(eightyOneWithFamily), ["a".repeat(76)]);
+  assert.deepEqual(parseOptionLines(`${"a".repeat(78)}${heart}`), [
+    `${"a".repeat(78)}${heart}`,
+  ]);
+  assert.deepEqual(parseOptionLines(`${"a".repeat(79)}${heart}`), [
+    "a".repeat(79),
+  ]);
+  assert.deepEqual(parseOptionLines(`${"a".repeat(78)}${flag}`), [
+    `${"a".repeat(78)}${flag}`,
+  ]);
+  assert.deepEqual(parseOptionLines(`${"a".repeat(79)}${flag}`), [
+    "a".repeat(79),
+  ]);
+
+  // Lone surrogates already present in input are replaced so JSONB saves never fail.
+  const sanitized = parseOptionLines(`${"a".repeat(79)}\ud83d`);
+  assert.deepEqual(sanitized, [`${"a".repeat(79)}\ufffd`]);
+  assert.equal(sanitized[0].isWellFormed(), true);
+
+  // Trailing whitespace exposed by truncation is still trimmed.
+  assert.deepEqual(parseOptionLines(`${"a".repeat(79)} 😀`), ["a".repeat(79)]);
+
+  // Editor round-trip preserves typed text for 80-code-point emoji choices.
+  assert.equal(
+    optionsTextToShow(`${eightyWithEmoji}\nNo`, [eightyWithEmoji, "No"]),
+    `${eightyWithEmoji}\nNo`,
+  );
+});
+
 test("a dropdown needs two choices and a radio button needs company", () => {
   const signerId = "signer-1";
 

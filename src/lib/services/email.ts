@@ -13,7 +13,11 @@ import {
   type EnvSource,
 } from "../utils/env.ts";
 import { buildEmailAddresses, type EmailAddresses } from "./email-addresses.ts";
-import { assertServiceConfig } from "./service-config.ts";
+import { CAPTURED_MESSAGE_ID_PREFIX } from "./captured-email.ts";
+import {
+  assertServiceConfig,
+  ServiceConfigurationError,
+} from "./service-config.ts";
 
 // The addresses mail is sent from and replied to are not needed here: they
 // come from RESEND_FROM_EMAIL and SUPPORT_EMAIL when those are set, and from
@@ -249,6 +253,33 @@ export function resolveEmailDriver(env: EnvSource = process.env): EmailDriver {
   );
 }
 
+export const CAPTURE_IN_PRODUCTION_ERROR_MESSAGE =
+  "EMAIL_DRIVER=capture drops every email and cannot be used in production.";
+
+/**
+ * Whether EMAIL_DRIVER=capture may be used in this deployment.
+ * Allowed in development, and for a production build that is being run on
+ * localhost (which is what the end-to-end test does). Never on Vercel or on
+ * a deployed production site, because it drops every email.
+ */
+export function isCaptureEmailDriverAllowed(
+  env: EnvSource = process.env,
+): boolean {
+  if (readEnv(env, "VERCEL") === "1") {
+    return false;
+  }
+
+  if (env.NODE_ENV !== "production") {
+    return true;
+  }
+
+  try {
+    return isLocalDeployment(env);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Development and test driver: nothing is sent. Each message is written as a
  * JSON file so a person (or the end-to-end test) can read the links in it.
@@ -257,12 +288,8 @@ function createCaptureEmailService(
   env: EnvSource,
   resolveAddresses: () => Promise<EmailAddresses>,
 ): EmailService {
-  // Allowed in development, and for a production build that is being run on
-  // localhost (which is what the end-to-end test does). Never on a real site.
-  if (env.NODE_ENV === "production" && !isLocalDeployment(env)) {
-    throw new Error(
-      "EMAIL_DRIVER=capture drops every email and cannot be used in production.",
-    );
+  if (!isCaptureEmailDriverAllowed(env)) {
+    throw new Error(CAPTURE_IN_PRODUCTION_ERROR_MESSAGE);
   }
 
   // The comment stops Turbopack from tracing the whole project into the
@@ -276,7 +303,7 @@ function createCaptureEmailService(
     message: TransactionalEmailMessage,
   ): Promise<EmailDeliveryResult> {
     const config = await resolveAddresses();
-    const messageId = `capture-${randomUUID()}`;
+    const messageId = `${CAPTURED_MESSAGE_ID_PREFIX}${randomUUID()}`;
     const filePath = path.join(
       /*turbopackIgnore: true*/ captureDir,
       `${String(Date.now())}-${messageId}.json`,
@@ -430,7 +457,7 @@ export async function resolveEmailAddresses(
   const driver = resolveEmailDriver(env);
   const mailgunDomain = getMailgunConfig(env)?.domain;
 
-  if (driver === "capture") {
+  if (driver === "capture" && isCaptureEmailDriverAllowed(env)) {
     return buildEmailAddresses(settings, DEFAULT_CAPTURE_SENDER_ADDRESS);
   }
 
@@ -438,6 +465,57 @@ export async function resolveEmailAddresses(
   return driver === "mailgun" && mailgunDomain
     ? buildEmailAddresses(settings, `noreply@${mailgunDomain}`)
     : buildEmailAddresses(settings);
+}
+
+/** What a sender is told when an action needs email and none is connected. */
+export const EMAIL_NOT_CONNECTED_MESSAGE =
+  "Email is not set up yet, so signers can't be emailed. An administrator can finish email setup in Settings, Organization.";
+
+/**
+ * Whether an error is createEmailService's refusal for a missing provider
+ * key: a known setup state, not a server failure (issue #53).
+ */
+export function isEmailNotConnectedError(error: unknown): boolean {
+  return (
+    error instanceof ServiceConfigurationError &&
+    error.message.startsWith("email service ")
+  );
+}
+
+/**
+ * Whether this install has an email provider to send with. Without one,
+ * a flow that would tell someone to check their inbox says that email is
+ * not set up instead (issue #95).
+ */
+export function canSendEmail(env: EnvSource = process.env): boolean {
+  try {
+    createEmailService({ env });
+    return true;
+  } catch {
+    // No provider key, or a driver this deployment cannot use: either way
+    // nothing would be sent.
+    return false;
+  }
+}
+
+/**
+ * An email service that is only built when a message is first sent. A flow
+ * that sends email as a side effect after saving its own work (a signer
+ * finishing or declining) uses it, so a missing provider key fails the
+ * send, which that flow already logs and survives, instead of the whole
+ * request (issue #96).
+ */
+export function createLazyEmailService(
+  create: () => EmailService = () => createEmailService(),
+): EmailService {
+  let service: EmailService | undefined;
+  const resolve = () => (service ??= create());
+
+  return {
+    send: async (message, options) => resolve().send(message, options),
+    sendBatch: async (messages, options) =>
+      resolve().sendBatch(messages, options),
+  };
 }
 
 export function createEmailService({

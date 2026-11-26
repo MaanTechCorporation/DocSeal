@@ -10,10 +10,19 @@ import {
 import type { FieldRecord } from "../schemas/field.ts";
 import type { SignerRecord } from "../schemas/signer.ts";
 import { buildSignatureManifestation } from "../signature-meanings.ts";
+import { hasSharedSigningStep, signingStepOf } from "../signing-steps.ts";
 import { describeSignerCorrectedEvent } from "./audit.ts";
+import { isCapturedMessageId } from "./captured-email.ts";
 import { canonicalJson } from "../utils/canonical-json.ts";
 import { normalizedRectToPdfRect } from "../utils/pdf-coords.ts";
 import { embedTextFaces, type TextFace } from "./pdf-fonts.ts";
+import {
+  drawOnDisplayedPage,
+  fieldOnDisplayedPage,
+  getDisplayedPageGeometry,
+  type DisplayedPageGeometry,
+  type StoredPageSize,
+} from "./pdf-page-geometry.ts";
 import { sha256Hex } from "./pdf-seal.ts";
 import { getBranding } from "../settings.ts";
 import {
@@ -151,6 +160,33 @@ function redactAuditEventForRecipients(
   });
 }
 
+/**
+ * Who did what an audit row records. An event's `signerName` and
+ * `signerEmail` metadata name the signer it concerns, which is the actor
+ * only on the signer's own events: a send or a reminder names the signer it
+ * went to while the sender (or the system) did it, so the signer's name must
+ * never be put in front of the sender's address (issue #52).
+ */
+export function describeAuditActor(event: AuditEventRecord): string {
+  if (event.actorType !== "signer") {
+    return event.actorEmail ?? event.actorType;
+  }
+
+  const actor =
+    event.actorEmail ??
+    (typeof event.metadata?.signerEmail === "string"
+      ? event.metadata.signerEmail
+      : event.actorType);
+  const signerName =
+    typeof event.metadata?.signerName === "string"
+      ? event.metadata.signerName
+      : null;
+
+  return signerName && actor !== signerName
+    ? `${signerName} <${actor}>`
+    : actor;
+}
+
 type WrappedLine = {
   font: TextFace;
   size: number;
@@ -263,6 +299,244 @@ function getFieldPadding(widthPt: number, heightPt: number): number {
   return Math.max(2, Math.min(widthPt, heightPt) * 0.12);
 }
 
+/**
+ * The smallest size an answer typed into a field is allowed to need. Signing
+ * refuses an answer that only fits its box below this, so every answer on a
+ * finished document can be read.
+ */
+export const MIN_FIELD_TEXT_SIZE = 4;
+
+/** Below this, a value already accepted is still drawn whole, however small. */
+const LAST_RESORT_FIELD_TEXT_SIZE = 0.5;
+
+const FIELD_TEXT_LINE_HEIGHT = 1.15;
+
+type FieldTextLayout = {
+  /** From the top of the first line to the foot of the last, in points. */
+  blockHeight: number;
+  fits: boolean;
+  lines: string[];
+  size: number;
+};
+
+/**
+ * Wraps a field value. Unlike wrapText, the spaces inside a line are kept as
+ * the signer typed them; only those where a line breaks are dropped.
+ */
+export function wrapFieldText(
+  font: TextFace,
+  size: number,
+  maxWidth: number,
+  text: string,
+): string[] {
+  const parts = text.trim().split(/(\s+)/);
+  const lines: string[] = [];
+  let currentLine = "";
+  let pendingSpace = "";
+
+  for (let index = 0; index < parts.length; index += 2) {
+    const word = parts[index] ?? "";
+
+    if (!word) {
+      continue;
+    }
+
+    for (const chunk of chunkLongWord(font, size, maxWidth, word)) {
+      const candidate = currentLine
+        ? `${currentLine}${pendingSpace}${chunk}`
+        : chunk;
+
+      if (!currentLine || font.widthOfTextAtSize(candidate, size) <= maxWidth) {
+        currentLine = candidate;
+      } else {
+        lines.push(currentLine);
+        currentLine = chunk;
+      }
+
+      pendingSpace = "";
+    }
+
+    pendingSpace = parts[index + 1] ?? "";
+  }
+
+  if (currentLine) {
+    lines.push(currentLine);
+  }
+
+  return lines;
+}
+
+function layoutAtSize(
+  font: TextFace,
+  text: string,
+  maxWidth: number,
+  maxHeight: number,
+  size: number,
+): FieldTextLayout {
+  const lines = wrapFieldText(font, size, maxWidth, text);
+  const blockHeight =
+    lines.length === 0
+      ? 0
+      : (lines.length - 1) * size * FIELD_TEXT_LINE_HEIGHT + size;
+
+  // A line can be wider than the box only when one character is.
+  const fits =
+    blockHeight <= maxHeight &&
+    lines.every((line) => font.widthOfTextAtSize(line, size) <= maxWidth);
+
+  return { blockHeight, fits, lines, size };
+}
+
+/**
+ * Lays a value out in its box: one line at the preferred size when it fits,
+ * otherwise wrapped onto as many lines as it needs, at the largest size, no
+ * smaller than minSize, at which every line fits. When even minSize is too
+ * big, the layout at minSize is returned with fits false.
+ */
+function layoutFieldText(
+  font: TextFace,
+  text: string,
+  maxWidth: number,
+  maxHeight: number,
+  preferredSize: number,
+  minSize: number,
+): FieldTextLayout {
+  const largest = Math.max(minSize, Math.min(preferredSize, maxHeight));
+  const atLargest = layoutAtSize(font, text, maxWidth, maxHeight, largest);
+
+  if (atLargest.fits) {
+    return atLargest;
+  }
+
+  const atSmallest = layoutAtSize(font, text, maxWidth, maxHeight, minSize);
+
+  if (!atSmallest.fits) {
+    return atSmallest;
+  }
+
+  // A smaller size never needs more room, so the size is found by halving.
+  let best = atSmallest;
+  let low = minSize;
+  let high = largest;
+
+  while (high - low > 0.1) {
+    const middle = (low + high) / 2;
+    const layout = layoutAtSize(font, text, maxWidth, maxHeight, middle);
+
+    if (layout.fits) {
+      best = layout;
+      low = middle;
+    } else {
+      high = middle;
+    }
+  }
+
+  return best;
+}
+
+/** The room a text value has inside its field, as the stamp lays it out. */
+function getTextFieldBox(rect: { heightPt: number; widthPt: number }) {
+  const padding = getFieldPadding(rect.widthPt, rect.heightPt);
+
+  // A box too small even for one line at the readable size still takes
+  // one line at it, as it always has, but never a second.
+  const maxHeight = Math.max(MIN_FIELD_TEXT_SIZE, rect.heightPt - padding * 2);
+
+  return {
+    maxHeight,
+    maxWidth: Math.max(MIN_FIELD_TEXT_SIZE, rect.widthPt - padding * 2),
+    padding,
+    preferredSize: Math.min(maxHeight, rect.heightPt * 0.64),
+  };
+}
+
+/**
+ * Whether a value typed into a field fits its box at a readable size on the
+ * page it is placed on. When it does not, also the most of its characters
+ * that would.
+ */
+export function measureFieldTextFit(
+  font: TextFace,
+  field: Pick<FieldRecord, "height" | "width" | "x" | "y">,
+  page: Pick<StoredPageSize, "heightPt" | "widthPt">,
+  value: string,
+): { fits: true } | { fits: false; maxCharacters: number } {
+  const text = value.trim();
+  const box = getTextFieldBox(normalizedRectToPdfRect(field, page));
+  const fitsText = (candidate: string) =>
+    layoutFieldText(
+      font,
+      candidate,
+      box.maxWidth,
+      box.maxHeight,
+      box.preferredSize,
+      MIN_FIELD_TEXT_SIZE,
+    ).fits;
+
+  if (fitsText(text)) {
+    return { fits: true };
+  }
+
+  const characters = Array.from(text);
+  let low = 0;
+  let high = characters.length - 1;
+
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+
+    if (fitsText(characters.slice(0, middle).join(""))) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
+  }
+
+  return { fits: false, maxCharacters: low };
+}
+
+/**
+ * The first value a signer typed that would not fit its box at a readable
+ * size, with the most of its characters that would, or null when all fit.
+ * Measured with the fonts the finished document is drawn with.
+ */
+export async function findTypedValueTooLongForField(
+  entries: ReadonlyArray<{
+    field: Pick<FieldRecord, "height" | "page" | "width" | "x" | "y">;
+    value: string;
+  }>,
+  pages: readonly StoredPageSize[],
+): Promise<{ maxCharacters: number; page: number } | null> {
+  const measurable = entries.flatMap((entry) => {
+    const page = pages.find((stored) => stored.pageNumber === entry.field.page);
+
+    return page && entry.value.trim() ? [{ ...entry, pageSize: page }] : [];
+  });
+
+  if (measurable.length === 0) {
+    return null;
+  }
+
+  const faces = await embedTextFaces(
+    await PDFDocument.create(),
+    measurable.map((entry) => entry.value),
+  );
+
+  for (const entry of measurable) {
+    const fit = measureFieldTextFit(
+      faces.regular,
+      entry.field,
+      entry.pageSize,
+      entry.value,
+    );
+
+    if (!fit.fits) {
+      return { maxCharacters: fit.maxCharacters, page: entry.field.page };
+    }
+  }
+
+  return null;
+}
+
 export function shouldStampField(field: FieldRecord): boolean {
   if (field.type === "checkbox" || field.type === "radio") {
     return typeof field.checked === "boolean";
@@ -371,19 +645,32 @@ function buildCertificateAuditEvents(input: {
   envelope: EnvelopeRecord;
   terminalTimestamp: number;
 }): AuditEventRecord[] {
-  const baseAuditEvents =
-    input.envelope.status === "completed"
-      ? stripCompletedAuditEvents(input.auditEvents)
-      : input.auditEvents;
-  const terminalAuditEvents =
-    input.envelope.status === "completed"
-      ? [buildCompletedAuditEvent(input.envelope.id, input.terminalTimestamp)]
-      : [];
+  // The rows come in the order they were recorded: the audit query reads
+  // them by the chain's sequence, and a caller adds the event it is about to
+  // record at the end. They are printed in that order and never re-sorted.
+  // created_at is in whole seconds and ids are random, so sorting by time and
+  // then id would shuffle events from the same second (issue #97).
+  if (input.envelope.status !== "completed") {
+    return [...input.auditEvents];
+  }
 
-  return [...baseAuditEvents, ...terminalAuditEvents].sort(
-    (left, right) =>
-      left.createdAt - right.createdAt || left.id.localeCompare(right.id),
+  // A completed envelope shows one completed row. A recorded one keeps its
+  // place, so events recorded after it stay after it. Before it is recorded,
+  // as when the last signature seals the envelope, it goes last.
+  const recordedCompletion = input.auditEvents.find(
+    (event) => event.event === "completed",
   );
+
+  if (recordedCompletion) {
+    return input.auditEvents.filter(
+      (event) => event.event !== "completed" || event === recordedCompletion,
+    );
+  }
+
+  return [
+    ...input.auditEvents,
+    buildCompletedAuditEvent(input.envelope.id, input.terminalTimestamp),
+  ];
 }
 
 export async function stampFieldValue(
@@ -396,15 +683,42 @@ export async function stampFieldValue(
   imageCache: Map<string, PDFImage>,
   pdfDocument: PDFDocument,
   storageService: StorageService,
+  // A field's place is given on the page as it is shown, so the value is
+  // drawn in those coordinates. On a rotated page it comes out turned with
+  // the page, and so reads upright. A caller that draws on another page
+  // than the one the field is on passes that page's geometry.
+  geometry: DisplayedPageGeometry = getDisplayedPageGeometry(page),
 ): Promise<void> {
   if (!shouldStampField(field)) {
     return;
   }
 
-  const rect = normalizedRectToPdfRect(field, {
-    heightPt: page.getHeight(),
-    widthPt: page.getWidth(),
-  });
+  await drawOnDisplayedPage(page, geometry, () =>
+    drawFieldValue(
+      field,
+      page,
+      geometry,
+      fonts,
+      imageCache,
+      pdfDocument,
+      storageService,
+    ),
+  );
+}
+
+async function drawFieldValue(
+  field: FieldRecord,
+  page: PDFPage,
+  geometry: DisplayedPageGeometry,
+  fonts: {
+    auditRegular: TextFace;
+    signature: TextFace;
+  },
+  imageCache: Map<string, PDFImage>,
+  pdfDocument: PDFDocument,
+  storageService: StorageService,
+): Promise<void> {
+  const rect = normalizedRectToPdfRect(field, geometry);
   const padding = getFieldPadding(rect.widthPt, rect.heightPt);
 
   switch (field.type) {
@@ -459,6 +773,7 @@ export async function stampFieldValue(
       return;
     }
     case "date":
+    case "name":
     case "text":
     case "number":
     case "dropdown": {
@@ -468,21 +783,45 @@ export async function stampFieldValue(
         return;
       }
 
-      const maxWidth = Math.max(12, rect.widthPt - padding * 2);
-      const maxHeight = Math.max(10, rect.heightPt - padding * 2);
-      const fontSize = fitTextSize(
+      // Wrapped and made smaller until the whole value is inside the box.
+      // Signing refuses a typed value that would only fit below a readable
+      // size, but a dropdown choice, or a value accepted earlier, is still
+      // drawn whole, never cut off.
+      const box = getTextFieldBox(rect);
+      let layout = layoutFieldText(
         fonts.auditRegular,
         textValue,
-        maxWidth,
-        maxHeight,
-        Math.min(maxHeight, rect.heightPt * 0.64),
+        box.maxWidth,
+        box.maxHeight,
+        box.preferredSize,
+        MIN_FIELD_TEXT_SIZE,
       );
 
-      fonts.auditRegular.drawText(page, textValue, {
-        color: rgb(0.12, 0.12, 0.12),
-        size: fontSize,
-        x: rect.xPt + padding,
-        y: rect.yPt + (rect.heightPt - fontSize) / 2 + fontSize * 0.2,
+      for (
+        let floor = LAST_RESORT_FIELD_TEXT_SIZE;
+        !layout.fits && floor >= 0.01;
+        floor /= 2
+      ) {
+        layout = layoutFieldText(
+          fonts.auditRegular,
+          textValue,
+          box.maxWidth,
+          box.maxHeight,
+          layout.size,
+          floor,
+        );
+      }
+
+      const { size } = layout;
+      const top = rect.yPt + (rect.heightPt + layout.blockHeight) / 2;
+
+      layout.lines.forEach((line, index) => {
+        fonts.auditRegular.drawText(page, line, {
+          color: rgb(0.12, 0.12, 0.12),
+          size,
+          x: rect.xPt + box.padding,
+          y: top - size * 0.8 - index * size * FIELD_TEXT_LINE_HEIGHT,
+        });
       });
 
       return;
@@ -548,61 +887,817 @@ export async function stampFieldValue(
   }
 }
 
-/**
- * Prints a Part 11 signature's manifestation just under the signature, or
- * just above it when the field sits at the foot of the page.
- */
-function stampSignatureManifestation(
-  field: FieldRecord,
-  page: PDFPage,
+const MANIFESTATION_MARGIN_PT = 2;
+const MANIFESTATION_GUTTER_PT = 8;
+const MANIFESTATION_VERTICAL_CLEARANCE_PT = 2;
+const MANIFESTATION_PREFERRED_SIZE_PT = 6.5;
+const MANIFESTATION_MIN_READABLE_SIZE_PT = 5;
+const MANIFESTATION_LAST_RESORT_SIZE_PT = 0.5;
+const MANIFESTATION_LINE_GAP_PT = 1.5;
+
+type PageBox = {
+  bottom: number;
+  left: number;
+  right: number;
+  top: number;
+};
+
+type ManifestationTextLayout = {
+  fitsHeight: boolean;
+  fitsWidth: boolean;
+  lineHeight: number;
+  lines: string[];
+  maxLineWidth: number;
+  size: number;
+};
+
+type PlacedManifestation = {
+  box: PageBox;
+  collidesWithManifestation: boolean;
+  fitsOnPage: boolean;
+  hasCollision: boolean;
+  hasDirectOverlap: boolean;
+  lineHeight: number;
+  lines: string[];
+  size: number;
+  topBaseline: number;
+  x: number;
+};
+
+type PageManifestationTarget = {
+  field: FieldRecord;
+  rect: { heightPt: number; widthPt: number; xPt: number; yPt: number };
+  text: string;
+};
+
+function rectToPageBox(rect: {
+  heightPt: number;
+  widthPt: number;
+  xPt: number;
+  yPt: number;
+}): PageBox {
+  return {
+    bottom: rect.yPt,
+    left: rect.xPt,
+    right: rect.xPt + rect.widthPt,
+    top: rect.yPt + rect.heightPt,
+  };
+}
+
+function boxesOverlap(
+  left: PageBox,
+  right: PageBox,
+  padX = 0,
+  padY = 0,
+): boolean {
+  return (
+    left.left < right.right + padX &&
+    left.right + padX > right.left &&
+    left.bottom < right.top + padY &&
+    left.top + padY > right.bottom
+  );
+}
+
+function manifestationLineHeight(size: number): number {
+  return size + Math.min(MANIFESTATION_LINE_GAP_PT, size * 0.3);
+}
+
+function manifestationRequiredHeight(lineCount: number, size: number): number {
+  return lineCount * manifestationLineHeight(size) + size * 0.25;
+}
+
+function measureManifestationLayout(
+  font: TextFace,
+  lines: string[],
+  size: number,
+  maxWidth: number,
+  maxHeight: number,
+): ManifestationTextLayout {
+  const lineHeight = manifestationLineHeight(size);
+  const maxLineWidth = lines.reduce(
+    (widest, line) => Math.max(widest, font.widthOfTextAtSize(line, size)),
+    0,
+  );
+
+  return {
+    fitsHeight: manifestationRequiredHeight(lines.length, size) <= maxHeight,
+    fitsWidth: maxLineWidth <= maxWidth,
+    lineHeight,
+    lines,
+    maxLineWidth,
+    size,
+  };
+}
+
+function layoutManifestationText(
   font: TextFace,
   text: string,
-): void {
-  const pageWidth = page.getWidth();
-  const rect = normalizedRectToPdfRect(field, {
-    heightPt: page.getHeight(),
-    widthPt: pageWidth,
-  });
-  const margin = 2;
-  const fullWidth = pageWidth - margin * 2;
-  const minimumSize = 5;
-  // One line when it fits at a readable size, otherwise one line per part
-  // (name, time, meaning), so nothing is shrunk away or runs off the page.
-  const oneLineSize = fitTextSize(font, text, fullWidth, 7, 6.5);
-  const lines =
-    font.widthOfTextAtSize(text, oneLineSize) <= fullWidth &&
-    oneLineSize >= minimumSize
-      ? [text]
-      : text.split(" | ");
-  const size = Math.max(
-    minimumSize,
-    Math.min(
-      ...lines.map((line) => fitTextSize(font, line, fullWidth, 7, 6.5)),
-    ),
+  maxWidth: number,
+  maxHeight: number,
+  options: { allowVerticalShrink?: boolean } = {},
+): ManifestationTextLayout {
+  const allowVerticalShrink = options.allowVerticalShrink ?? false;
+  const parts = text.split(" | ");
+
+  // One line when it fits at a readable size, preserving the single-line
+  // manifestation whenever there is horizontal (and when constrained,
+  // vertical) room.
+  for (
+    let size = MANIFESTATION_PREFERRED_SIZE_PT;
+    size >= MANIFESTATION_MIN_READABLE_SIZE_PT;
+    size -= 0.5
+  ) {
+    const candidate = measureManifestationLayout(
+      font,
+      [text],
+      size,
+      maxWidth,
+      maxHeight,
+    );
+
+    if (candidate.fitsWidth && (!allowVerticalShrink || candidate.fitsHeight)) {
+      return candidate;
+    }
+  }
+
+  // One line per part (name, UTC time, meaning) when every part fits whole
+  // inside maxWidth at a readable size.
+  for (
+    let size = MANIFESTATION_PREFERRED_SIZE_PT;
+    size >= MANIFESTATION_MIN_READABLE_SIZE_PT;
+    size -= 0.5
+  ) {
+    const candidate = measureManifestationLayout(
+      font,
+      parts,
+      size,
+      maxWidth,
+      maxHeight,
+    );
+
+    if (candidate.fitsWidth && (!allowVerticalShrink || candidate.fitsHeight)) {
+      return candidate;
+    }
+  }
+
+  // Wrap each part independently inside maxWidth at the largest readable
+  // size that fits, so long names or narrow columns never overflow or lose
+  // text.
+  let firstWidthFit: ManifestationTextLayout | null = null;
+
+  for (
+    let size = MANIFESTATION_PREFERRED_SIZE_PT;
+    size >= MANIFESTATION_MIN_READABLE_SIZE_PT;
+    size -= 0.5
+  ) {
+    const wrapped = parts.flatMap((part) =>
+      wrapFieldText(font, size, maxWidth, part),
+    );
+    const candidate = measureManifestationLayout(
+      font,
+      wrapped,
+      size,
+      maxWidth,
+      maxHeight,
+    );
+
+    if (candidate.fitsWidth) {
+      if (!firstWidthFit) {
+        firstWidthFit = candidate;
+      }
+
+      if (candidate.fitsHeight) {
+        return candidate;
+      }
+    }
+  }
+
+  if (firstWidthFit && !allowVerticalShrink) {
+    return firstWidthFit;
+  }
+
+  // Last resort: shrink below the readable floor only when a single glyph
+  // exceeds maxWidth or neither side of the field can fit the wrapped block
+  // at a readable size, so nothing is ever clipped or truncated.
+  let fallback =
+    firstWidthFit ??
+    measureManifestationLayout(
+      font,
+      parts.flatMap((part) =>
+        wrapFieldText(font, MANIFESTATION_MIN_READABLE_SIZE_PT, maxWidth, part),
+      ),
+      MANIFESTATION_MIN_READABLE_SIZE_PT,
+      maxWidth,
+      maxHeight,
+    );
+
+  for (
+    let size = MANIFESTATION_MIN_READABLE_SIZE_PT - 0.5;
+    size >= 0.01;
+    size = size > MANIFESTATION_LAST_RESORT_SIZE_PT ? size - 0.5 : size / 2
+  ) {
+    const singleLine = measureManifestationLayout(
+      font,
+      [text],
+      size,
+      maxWidth,
+      maxHeight,
+    );
+
+    if (
+      singleLine.fitsWidth &&
+      (!allowVerticalShrink || singleLine.fitsHeight)
+    ) {
+      return singleLine;
+    }
+
+    const wrapped = parts.flatMap((part) =>
+      wrapFieldText(font, size, maxWidth, part),
+    );
+    const candidate = measureManifestationLayout(
+      font,
+      wrapped,
+      size,
+      maxWidth,
+      maxHeight,
+    );
+
+    fallback = candidate;
+
+    if (candidate.fitsWidth && (!allowVerticalShrink || candidate.fitsHeight)) {
+      return candidate;
+    }
+  }
+
+  return fallback;
+}
+
+function pickLargestFittingCandidate(
+  candidates: ReadonlyArray<PlacedManifestation | null>,
+  predicate: (candidate: PlacedManifestation) => boolean,
+): PlacedManifestation | null {
+  let best: PlacedManifestation | null = null;
+
+  for (const candidate of candidates) {
+    if (!candidate || !predicate(candidate)) {
+      continue;
+    }
+
+    if (!best || candidate.size > best.size) {
+      best = candidate;
+    }
+  }
+
+  return best;
+}
+
+/**
+ * Lays out every Part 11 signature manifestation on one page so neighboring
+ * fields and side-by-side manifestations never overlap each other or run past
+ * the page edge (issue #220).
+ */
+function layoutPageManifestations(
+  targets: readonly PageManifestationTarget[],
+  allFieldBoxes: readonly { box: PageBox; field: FieldRecord }[],
+  geometry: DisplayedPageGeometry,
+  font: TextFace,
+): Map<FieldRecord, PlacedManifestation> {
+  const margin = Math.min(
+    MANIFESTATION_MARGIN_PT,
+    geometry.widthPt / 4,
+    geometry.heightPt / 4,
   );
-  const lineHeight = size + 1.5;
-  const blockHeight = lineHeight * lines.length;
-  const below = rect.yPt - blockHeight;
-  // The top line's baseline. Below the field when there is room, above it
-  // at the foot of the page.
-  const top =
-    below >= margin
-      ? rect.yPt - lineHeight
-      : Math.min(
-          rect.yPt + rect.heightPt + blockHeight - size,
-          page.getHeight() - size - margin,
+  const pageRight = geometry.widthPt - margin;
+  const pageTop = geometry.heightPt - margin;
+
+  // Rightmost signatures go first so every manifestation to the right has its
+  // final bounding box before a signature to its left computes its available
+  // horizontal width. Ties at the same x run bottom-to-top so a signature
+  // forced above at the foot of the page claims its space before one above it.
+  const ordered = [...targets].sort(
+    (left, right) =>
+      right.rect.xPt - left.rect.xPt ||
+      left.rect.yPt - right.rect.yPt ||
+      (left.field.id ?? "").localeCompare(right.field.id ?? ""),
+  );
+  const placed = new Map<FieldRecord, PlacedManifestation>();
+  const placedBoxes: PageBox[] = [];
+
+  for (const target of ordered) {
+    const { field, rect, text } = target;
+    const ownBox = rectToPageBox(rect);
+    const otherFieldBoxes = allFieldBoxes
+      .filter((entry) => entry.field !== field)
+      .map((entry) => entry.box);
+    const blockers = [...otherFieldBoxes, ...placedBoxes];
+    const xAnchor = Math.max(
+      margin,
+      Math.min(rect.xPt, Math.max(margin, pageRight - 4)),
+    );
+    const spaceBelow = Math.max(0, rect.yPt - margin);
+    const spaceAbove = Math.max(0, pageTop - (rect.yPt + rect.heightPt));
+
+    const buildPlacement = (
+      x: number,
+      topBaseline: number,
+      layout: ManifestationTextLayout,
+      fitsVertically: boolean,
+    ): PlacedManifestation => {
+      const descender = layout.size * 0.25;
+      const finalBottomBaseline =
+        topBaseline - (layout.lines.length - 1) * layout.lineHeight;
+      const box: PageBox = {
+        bottom: finalBottomBaseline - descender,
+        left: x,
+        right: x + layout.maxLineWidth,
+        top: topBaseline + layout.size,
+      };
+      const collidesWithManifestation = placedBoxes.some((blocker) =>
+        boxesOverlap(box, blocker, 0, MANIFESTATION_VERTICAL_CLEARANCE_PT),
+      );
+      const collidesWithField = otherFieldBoxes.some((blocker) =>
+        boxesOverlap(box, blocker, 0, MANIFESTATION_VERTICAL_CLEARANCE_PT),
+      );
+      const collidesWithOwnField = boxesOverlap(box, ownBox, 0, 0);
+      const hasCollision =
+        collidesWithManifestation || collidesWithField || collidesWithOwnField;
+      const hasDirectOverlap =
+        collidesWithOwnField ||
+        placedBoxes.some((blocker) => boxesOverlap(box, blocker, 0, 0)) ||
+        otherFieldBoxes.some((blocker) => boxesOverlap(box, blocker, 0, 0));
+
+      return {
+        box,
+        collidesWithManifestation,
+        fitsOnPage:
+          fitsVertically &&
+          box.left >= margin - 0.01 &&
+          box.right <= pageRight + 0.01 &&
+          box.bottom >= margin - 0.01 &&
+          box.top <= pageTop + 0.01,
+        hasCollision,
+        hasDirectOverlap,
+        lineHeight: layout.lineHeight,
+        lines: layout.lines,
+        size: layout.size,
+        topBaseline,
+        x,
+      };
+    };
+
+    const layoutAtSide = (
+      side: "below" | "above",
+      options: {
+        allowVerticalShrink: boolean;
+        constrainToVerticalBlockers?: boolean;
+        shiftLeft?: boolean;
+        verticalClearance?: number;
+      },
+    ): PlacedManifestation => {
+      const { allowVerticalShrink } = options;
+      const constrainToVerticalBlockers =
+        options.constrainToVerticalBlockers ?? false;
+      const shiftLeft = options.shiftLeft ?? false;
+      const verticalClearance =
+        options.verticalClearance ?? MANIFESTATION_VERTICAL_CLEARANCE_PT;
+      let leftBound = shiftLeft ? margin : xAnchor;
+      let rightBound = pageRight;
+      let verticalLimit = side === "below" ? spaceBelow : spaceAbove;
+      let current!: PlacedManifestation;
+      const maxPasses = blockers.length * 3 + 2;
+
+      // Each pass strictly tightens at least one horizontal or vertical bound
+      // against a finite blocker edge, so this always reaches a fixed point.
+      for (let pass = 0; pass < maxPasses; pass += 1) {
+        const maxWidth = Math.max(0.5, rightBound - leftBound);
+        const layout = layoutManifestationText(
+          font,
+          text,
+          maxWidth,
+          Math.max(0, verticalLimit),
+          { allowVerticalShrink },
         );
+        const x = shiftLeft
+          ? Math.max(
+              leftBound,
+              Math.min(xAnchor, rightBound - layout.maxLineWidth),
+            )
+          : xAnchor;
+        const descender = layout.size * 0.25;
+        const gap = layout.lineHeight - layout.size;
+        let topBaseline: number;
+        let fitsVertically: boolean;
 
-  lines.forEach((line, index) => {
-    const width = font.widthOfTextAtSize(line, size);
-    // Starts under the field, moved left if it would run off the page.
-    const x = Math.max(margin, Math.min(rect.xPt, pageWidth - width - margin));
+        if (side === "below") {
+          topBaseline = rect.yPt - layout.lineHeight;
+          const bottomBaseline =
+            topBaseline - (layout.lines.length - 1) * layout.lineHeight;
 
+          fitsVertically = bottomBaseline - descender >= margin;
+          if (
+            !fitsVertically &&
+            allowVerticalShrink &&
+            !constrainToVerticalBlockers
+          ) {
+            const shiftUp = margin - (bottomBaseline - descender);
+
+            topBaseline = Math.min(
+              topBaseline + shiftUp,
+              pageTop - layout.size,
+            );
+          }
+        } else {
+          const bottomBaseline = rect.yPt + rect.heightPt + gap + descender;
+
+          topBaseline =
+            bottomBaseline + (layout.lines.length - 1) * layout.lineHeight;
+          fitsVertically = topBaseline + layout.size <= pageTop;
+
+          if (!fitsVertically && !constrainToVerticalBlockers) {
+            topBaseline = Math.min(topBaseline, pageTop - layout.size);
+          }
+        }
+
+        current = buildPlacement(x, topBaseline, layout, fitsVertically);
+
+        let nextLeftBound = leftBound;
+        let nextRightBound = rightBound;
+        let nextVerticalLimit = verticalLimit;
+
+        for (const blocker of blockers) {
+          const isRightSideBlocker =
+            blocker.left > xAnchor &&
+            (blocker.left >= rect.xPt + rect.widthPt - 1 ||
+              blocker.left - xAnchor >= 24);
+
+          if (
+            isRightSideBlocker &&
+            boxesOverlap(
+              current.box,
+              blocker,
+              MANIFESTATION_GUTTER_PT,
+              verticalClearance,
+            )
+          ) {
+            const gutter = Math.min(
+              MANIFESTATION_GUTTER_PT,
+              (blocker.left - xAnchor) * 0.25,
+            );
+            const candidateBound = blocker.left - gutter;
+
+            if (candidateBound < nextRightBound) {
+              nextRightBound = candidateBound;
+            }
+            continue;
+          }
+
+          if (
+            shiftLeft &&
+            blocker.right <= xAnchor + 0.01 &&
+            boxesOverlap(
+              current.box,
+              blocker,
+              MANIFESTATION_GUTTER_PT,
+              verticalClearance,
+            )
+          ) {
+            const gutter = Math.min(
+              MANIFESTATION_GUTTER_PT,
+              (xAnchor - blocker.right) * 0.25,
+            );
+            const candidateLeft = Math.min(xAnchor, blocker.right + gutter);
+
+            if (candidateLeft > nextLeftBound) {
+              nextLeftBound = candidateLeft;
+            }
+            continue;
+          }
+
+          if (
+            constrainToVerticalBlockers &&
+            boxesOverlap(current.box, blocker, 0, verticalClearance)
+          ) {
+            if (side === "below" && blocker.top <= rect.yPt + 0.01) {
+              const candidateHeight = Math.max(
+                0,
+                rect.yPt - (blocker.top + verticalClearance),
+              );
+
+              if (candidateHeight < nextVerticalLimit) {
+                nextVerticalLimit = candidateHeight;
+              }
+            } else if (
+              side === "above" &&
+              blocker.bottom >= rect.yPt + rect.heightPt - 0.01
+            ) {
+              const candidateHeight = Math.max(
+                0,
+                blocker.bottom - verticalClearance - (rect.yPt + rect.heightPt),
+              );
+
+              if (candidateHeight < nextVerticalLimit) {
+                nextVerticalLimit = candidateHeight;
+              }
+            }
+          }
+        }
+
+        const changed =
+          nextRightBound < rightBound - 0.01 ||
+          nextLeftBound > leftBound + 0.01 ||
+          nextVerticalLimit < verticalLimit - 0.01;
+
+        if (!changed) {
+          break;
+        }
+
+        leftBound = nextLeftBound;
+        rightBound = nextRightBound;
+        verticalLimit = nextVerticalLimit;
+      }
+
+      return current;
+    };
+
+    const layoutBeside = (
+      side: "left" | "right",
+      options: {
+        allowVerticalShrink: boolean;
+        verticalClearance?: number;
+      },
+    ): PlacedManifestation | null => {
+      const { allowVerticalShrink } = options;
+      const verticalClearance =
+        options.verticalClearance ?? MANIFESTATION_VERTICAL_CLEARANCE_PT;
+      let leftBound =
+        side === "right"
+          ? rect.xPt + rect.widthPt + MANIFESTATION_GUTTER_PT
+          : margin;
+      let rightBound =
+        side === "right" ? pageRight : rect.xPt - MANIFESTATION_GUTTER_PT;
+
+      if (rightBound - leftBound < 12) {
+        return null;
+      }
+
+      const verticalInset =
+        rect.heightPt > verticalClearance * 3 ? verticalClearance : 0;
+      const bandBottom = Math.max(margin, rect.yPt + verticalInset);
+      const bandTop = Math.min(
+        pageTop,
+        rect.yPt + rect.heightPt - verticalInset,
+      );
+      const availableHeight = bandTop - bandBottom;
+
+      if (availableHeight <= 0) {
+        return null;
+      }
+
+      let current: PlacedManifestation | null = null;
+      const maxPasses = blockers.length + 2;
+
+      for (let pass = 0; pass < maxPasses; pass += 1) {
+        const maxWidth = Math.max(0.5, rightBound - leftBound);
+        const layout = layoutManifestationText(
+          font,
+          text,
+          maxWidth,
+          availableHeight,
+          { allowVerticalShrink },
+        );
+        const descender = layout.size * 0.25;
+        const x =
+          side === "right"
+            ? leftBound
+            : Math.max(leftBound, rightBound - layout.maxLineWidth);
+        const bottomBaseline = bandBottom + descender;
+        const topBaseline =
+          bottomBaseline + (layout.lines.length - 1) * layout.lineHeight;
+        const fitsVertically = topBaseline + layout.size <= bandTop + 0.01;
+
+        current = buildPlacement(x, topBaseline, layout, fitsVertically);
+
+        let nextLeftBound = leftBound;
+        let nextRightBound = rightBound;
+
+        for (const blocker of blockers) {
+          if (
+            !boxesOverlap(
+              current.box,
+              blocker,
+              MANIFESTATION_GUTTER_PT,
+              verticalClearance,
+            )
+          ) {
+            continue;
+          }
+
+          if (side === "right" && blocker.left > leftBound) {
+            const gutter = Math.min(
+              MANIFESTATION_GUTTER_PT,
+              (blocker.left - leftBound) * 0.25,
+            );
+            const candidateRight = blocker.left - gutter;
+
+            if (candidateRight < nextRightBound) {
+              nextRightBound = candidateRight;
+            }
+          } else if (side === "left" && blocker.right < rightBound) {
+            const gutter = Math.min(
+              MANIFESTATION_GUTTER_PT,
+              (rightBound - blocker.right) * 0.25,
+            );
+            const candidateLeft = blocker.right + gutter;
+
+            if (candidateLeft > nextLeftBound) {
+              nextLeftBound = candidateLeft;
+            }
+          }
+        }
+
+        const changed =
+          nextRightBound < rightBound - 0.01 ||
+          nextLeftBound > leftBound + 0.01;
+
+        if (!changed || nextRightBound - nextLeftBound < 4) {
+          break;
+        }
+
+        leftBound = nextLeftBound;
+        rightBound = nextRightBound;
+      }
+
+      return current;
+    };
+
+    const below = layoutAtSide("below", { allowVerticalShrink: false });
+    let chosen: PlacedManifestation;
+
+    if (below.fitsOnPage && !below.hasCollision) {
+      chosen = below;
+    } else {
+      const above = layoutAtSide("above", { allowVerticalShrink: false });
+
+      if (above.fitsOnPage && !above.hasCollision) {
+        chosen = above;
+      } else {
+        const belowShifted = layoutAtSide("below", {
+          allowVerticalShrink: false,
+          shiftLeft: true,
+        });
+        const aboveShifted = layoutAtSide("above", {
+          allowVerticalShrink: false,
+          shiftLeft: true,
+        });
+
+        if (belowShifted.fitsOnPage && !belowShifted.hasCollision) {
+          chosen = belowShifted;
+        } else if (aboveShifted.fitsOnPage && !aboveShifted.hasCollision) {
+          chosen = aboveShifted;
+        } else {
+          const verticalFitCandidates = [
+            layoutAtSide("below", {
+              allowVerticalShrink: true,
+              constrainToVerticalBlockers: true,
+            }),
+            layoutAtSide("above", {
+              allowVerticalShrink: true,
+              constrainToVerticalBlockers: true,
+            }),
+            layoutAtSide("below", {
+              allowVerticalShrink: true,
+              constrainToVerticalBlockers: true,
+              shiftLeft: true,
+            }),
+            layoutAtSide("above", {
+              allowVerticalShrink: true,
+              constrainToVerticalBlockers: true,
+              shiftLeft: true,
+            }),
+          ];
+          const besideCandidates = [
+            layoutBeside("right", { allowVerticalShrink: true }),
+            layoutBeside("left", { allowVerticalShrink: true }),
+          ];
+          const readableVertical = pickLargestFittingCandidate(
+            verticalFitCandidates,
+            (candidate) =>
+              candidate.fitsOnPage &&
+              !candidate.hasCollision &&
+              candidate.size >= MANIFESTATION_MIN_READABLE_SIZE_PT,
+          );
+          const readableBeside = readableVertical
+            ? null
+            : pickLargestFittingCandidate(
+                besideCandidates,
+                (candidate) =>
+                  candidate.fitsOnPage &&
+                  !candidate.hasCollision &&
+                  candidate.size >= MANIFESTATION_MIN_READABLE_SIZE_PT,
+              );
+          const anyClear =
+            readableVertical ??
+            readableBeside ??
+            pickLargestFittingCandidate(
+              [...verticalFitCandidates, ...besideCandidates],
+              (candidate) => candidate.fitsOnPage && !candidate.hasCollision,
+            );
+
+          if (anyClear) {
+            chosen = anyClear;
+          } else {
+            const tightCandidates = [
+              layoutAtSide("below", {
+                allowVerticalShrink: true,
+                constrainToVerticalBlockers: true,
+                verticalClearance: 0,
+              }),
+              layoutAtSide("above", {
+                allowVerticalShrink: true,
+                constrainToVerticalBlockers: true,
+                verticalClearance: 0,
+              }),
+              layoutAtSide("below", {
+                allowVerticalShrink: true,
+                constrainToVerticalBlockers: true,
+                shiftLeft: true,
+                verticalClearance: 0,
+              }),
+              layoutAtSide("above", {
+                allowVerticalShrink: true,
+                constrainToVerticalBlockers: true,
+                shiftLeft: true,
+                verticalClearance: 0,
+              }),
+              layoutBeside("right", {
+                allowVerticalShrink: true,
+                verticalClearance: 0,
+              }),
+              layoutBeside("left", {
+                allowVerticalShrink: true,
+                verticalClearance: 0,
+              }),
+            ];
+            const noDirectOverlap = pickLargestFittingCandidate(
+              tightCandidates,
+              (candidate) =>
+                candidate.fitsOnPage && !candidate.hasDirectOverlap,
+            );
+
+            if (noDirectOverlap) {
+              chosen = noDirectOverlap;
+            } else if (below.fitsOnPage && !below.collidesWithManifestation) {
+              chosen = below;
+            } else if (above.fitsOnPage && !above.collidesWithManifestation) {
+              chosen = above;
+            } else if (below.fitsOnPage) {
+              chosen = below;
+            } else if (above.fitsOnPage) {
+              chosen = above;
+            } else {
+              chosen = layoutAtSide(
+                spaceBelow >= spaceAbove ? "below" : "above",
+                { allowVerticalShrink: true },
+              );
+            }
+          }
+        }
+      }
+    }
+
+    placed.set(field, chosen);
+    placedBoxes.push(chosen.box);
+  }
+
+  return placed;
+}
+
+/**
+ * Prints a Part 11 signature's manifestation just under the signature, or
+ * just above it when there is no room below.
+ */
+async function stampSignatureManifestation(
+  page: PDFPage,
+  geometry: DisplayedPageGeometry,
+  font: TextFace,
+  placement: PlacedManifestation,
+): Promise<void> {
+  await drawOnDisplayedPage(page, geometry, () =>
+    drawSignatureManifestation(page, font, placement),
+  );
+}
+
+function drawSignatureManifestation(
+  page: PDFPage,
+  font: TextFace,
+  placement: PlacedManifestation,
+): void {
+  placement.lines.forEach((line, index) => {
     font.drawText(page, line, {
       color: rgb(0.2, 0.2, 0.24),
-      size,
-      x,
-      y: top - index * lineHeight,
+      size: placement.size,
+      x: placement.x,
+      y: placement.topBaseline - index * placement.lineHeight,
     });
   });
 }
@@ -717,15 +1812,46 @@ function buildAuditLines(input: {
     },
   );
 
-  pushParagraph("Signers", input.fonts.bold, sectionFontSize, {
-    gapAfter: 4,
-  });
+  const approvers = input.signers.filter(
+    (signer) => signer.role === "approver",
+  );
+
+  pushParagraph(
+    approvers.length > 0 ? "Signers and approvers" : "Signers",
+    input.fonts.bold,
+    sectionFontSize,
+    {
+      gapAfter: 4,
+    },
+  );
+
+  if (approvers.length > 0) {
+    pushParagraph(
+      "Approvers reviewed the document and approved or rejected it. They placed no signature and nothing of theirs is stamped on the document.",
+      input.fonts.regular,
+      bodyFontSize,
+    );
+  }
+
+  // Each signer is numbered by their step of the signing order. With every
+  // signer in a step of their own that is their place in the list; signers
+  // who share a number were asked to sign at the same time, and the line
+  // below says so.
+  if (hasSharedSigningStep(input.signers)) {
+    pushParagraph(
+      "Signers with the same number were asked to sign at the same time. Each number started once everyone with the number before it had signed.",
+      input.fonts.regular,
+      bodyFontSize,
+    );
+  }
 
   for (const signer of input.signers) {
     const actionLabel = getSignerCertificateActionLabel(input.envelope, signer);
+    const step = signingStepOf(signer);
+    const roleLabel = signer.role === "approver" ? " | Approver" : "";
     const signerLabel = input.redactForRecipients
-      ? `${signer.signOrder}. ${signer.name} | ${actionLabel}`
-      : `${signer.signOrder}. ${signer.name} <${signer.email}> | ${actionLabel}`;
+      ? `${step}. ${signer.name}${roleLabel} | ${actionLabel}`
+      : `${step}. ${signer.name} <${signer.email}>${roleLabel} | ${actionLabel}`;
 
     pushParagraph(signerLabel, input.fonts.regular, bodyFontSize);
 
@@ -735,6 +1861,34 @@ function buildAuditLines(input: {
       Boolean(input.redactForRecipients),
     )) {
       pushParagraph(`   ${detail}`, input.fonts.regular, bodyFontSize);
+    }
+  }
+
+  // Approvals on their own, so they are never read as signatures.
+  const decided = approvers.filter(
+    (signer) => signer.status === "signed" || signer.status === "declined",
+  );
+
+  if (decided.length > 0) {
+    pushParagraph("Approvals", input.fonts.bold, sectionFontSize, {
+      gapAfter: 4,
+      gapBefore: 10,
+    });
+
+    for (const approver of decided) {
+      const who = input.redactForRecipients
+        ? approver.name
+        : `${approver.name} <${approver.email}>`;
+
+      pushParagraph(
+        approver.status === "signed"
+          ? `Approved by ${who} at ${formatAuditTimestamp(approver.signedAt)}`
+          : `Rejected by ${who} at ${formatAuditTimestamp(approver.declinedAt)}${
+              approver.declineReason ? `: ${approver.declineReason}` : ""
+            }`,
+        input.fonts.regular,
+        bodyFontSize,
+      );
     }
   }
 
@@ -766,18 +1920,7 @@ function buildAuditLines(input: {
   });
 
   for (const event of auditEvents) {
-    const actor =
-      event.actorEmail ??
-      (typeof event.metadata?.signerEmail === "string"
-        ? event.metadata.signerEmail
-        : event.actorType);
-    const signerName =
-      typeof event.metadata?.signerName === "string"
-        ? event.metadata.signerName
-        : null;
-    const actorLabel =
-      signerName && actor !== signerName ? `${signerName} <${actor}>` : actor;
-
+    const actorLabel = describeAuditActor(event);
     const eventLabel =
       event.event === "signer_corrected" ? "Signer corrected" : event.event;
 
@@ -916,6 +2059,23 @@ function currentSignerIdentityStart(
   return starts[starts.length - 1] ?? 0;
 }
 
+/**
+ * For a signature made inside another app: identity then rests on that app
+ * having signed the person in. The record shows only where the link was
+ * given, not that the app checked who opened it, so the certificate says
+ * the check was left to the app rather than that it happened.
+ */
+function describeEmbeddedDelivery(embedded: Record<string, unknown>): string {
+  const origin =
+    typeof embedded.origin === "string" ? embedded.origin : "another site";
+  const key =
+    typeof embedded.apiKeyName === "string"
+      ? ` through the API key "${embedded.apiKeyName}"`
+      : "";
+
+  return `a signing link given to the app at ${origin}${key} (embedded signing; identifying the signer was left to that app)`;
+}
+
 /** What the record shows about how one signer was identified and agreed. */
 function describeSignerEvidence(
   signer: SignerRecord,
@@ -926,7 +2086,16 @@ function describeSignerEvidence(
     (event) => event.metadata?.signerId === signer.id,
   );
   const details: string[] = [];
-  const signed = forSigner.find((event) => event.event === "signed");
+  const approver = signer.role === "approver";
+  // The signature, or an approver's approval.
+  const signed = forSigner.find(
+    (event) => event.event === (approver ? "approved" : "signed"),
+  );
+  // A decline or a rejection, which also say which checks the person had
+  // passed.
+  const ended = forSigner.find(
+    (event) => event.event === "declined" || event.event === "rejected",
+  );
   // A correction clears the row's consent. The first consented event for
   // this signer id can still be the previous person's, so only agreement
   // recorded after the latest standing correction counts as this
@@ -944,9 +2113,26 @@ function describeSignerEvidence(
     }
   }
 
+  // A signer who declined, or an approver who rejected, in another app has
+  // no signed event; the declined or rejected event carries the same record
+  // of where it happened.
+  const declined =
+    signed === undefined && signer.status === "declined"
+      ? forSigner.findLast(
+          (event) => event.event === "declined" || event.event === "rejected",
+        )
+      : undefined;
+  const embeddedSource = signed ?? declined;
+  const embedded =
+    embeddedSource?.metadata?.embedded &&
+    typeof embeddedSource.metadata.embedded === "object"
+      ? (embeddedSource.metadata.embedded as Record<string, unknown>)
+      : null;
   const checks = [
-    "possession of the emailed signing link",
-    ...readStringArray(signed?.metadata?.authMethods).map(
+    embedded
+      ? describeEmbeddedDelivery(embedded)
+      : "possession of the emailed signing link",
+    ...readStringArray((signed ?? ended)?.metadata?.authMethods).map(
       (method) => AUTHENTICATION_LABELS[method] ?? method,
     ),
   ];
@@ -995,7 +2181,9 @@ function describeSignerEvidence(
   details.push(...describeProviderSignatureEvidence(signed, redacted));
 
   if (!redacted && signed?.ipAddress) {
-    details.push(`Signed from IP ${signed.ipAddress}`);
+    details.push(
+      `${approver ? "Approved" : "Signed"} from IP ${signed.ipAddress}`,
+    );
   }
 
   return details;
@@ -1039,7 +2227,12 @@ function describeEventEvidence(event: AuditEventRecord): string[] {
       [
         kind ? `email ${kind.replaceAll("_", " ")}` : "email",
         recipient ? `to ${recipient}` : null,
-        messageId ? `accepted by the mail provider as ${messageId}` : null,
+        messageId
+          ? isCapturedMessageId(messageId)
+            ? // The capture driver only wrote it to the local outbox.
+              `captured locally as ${messageId}, not sent`
+            : `accepted by the mail provider as ${messageId}`
+          : null,
       ]
         .filter(Boolean)
         .join(" "),
@@ -1072,21 +2265,25 @@ function getSignerCertificateActionLabel(
   envelope: EnvelopeRecord,
   signer: SignerRecord,
 ): string {
+  // An approver's turn done is an approval, and their decline a rejection.
+  const approver = signer.role === "approver";
+  const awaiting = approver ? "Awaiting approval" : "Awaiting signature";
+
   switch (signer.status) {
     case "signed":
-      return `Signed at ${formatAuditTimestamp(signer.signedAt)}`;
+      return `${approver ? "Approved" : "Signed"} at ${formatAuditTimestamp(signer.signedAt)}`;
     case "declined":
-      return `Declined at ${formatAuditTimestamp(signer.declinedAt)}`;
+      return `${approver ? "Rejected" : "Declined"} at ${formatAuditTimestamp(signer.declinedAt)}`;
     case "notified":
       if (envelope.status === "voided") {
-        return "Awaiting signature when envelope was voided";
+        return `${awaiting} when envelope was voided`;
       }
 
       if (envelope.status === "declined") {
-        return "Awaiting signature when envelope was declined";
+        return `${awaiting} when envelope was declined`;
       }
 
-      return "Awaiting signature";
+      return awaiting;
     case "pending":
       return "Not reached";
     default: {
@@ -1297,6 +2494,8 @@ export async function renderFinalizedEnvelopePdf(
     envelope: EnvelopeRecord;
     fields: FieldRecord[];
     includeAuditTrail?: boolean;
+    /** The envelope's stored page sizes, which fields were placed against. */
+    pages: readonly StoredPageSize[];
     signers: SignerRecord[];
     sourcePdfKey: string;
   },
@@ -1360,15 +2559,34 @@ export async function renderFinalizedEnvelopePdf(
     },
   );
   const imageCache = new Map<string, PDFImage>();
+  const storedPages = new Map(
+    input.pages.map((page) => [page.pageNumber, page]),
+  );
+  const pageManifestations = new Map<
+    number,
+    {
+      allFieldBoxes: Array<{ box: PageBox; field: FieldRecord }>;
+      geometry: DisplayedPageGeometry;
+      page: PDFPage;
+      targets: PageManifestationTarget[];
+    }
+  >();
 
-  for (const field of stampedFields) {
-    const page = pdfDocument.getPage(field.page - 1);
+  for (const placedField of stampedFields) {
+    const page = pdfDocument.getPage(placedField.page - 1);
 
     if (!page) {
       throw new PdfFinalizeError(
-        `Field ${field.id} references missing page ${field.page}.`,
+        `Field ${placedField.id} references missing page ${placedField.page}.`,
       );
     }
+
+    const geometry = getDisplayedPageGeometry(page);
+    const field = fieldOnDisplayedPage(
+      placedField,
+      storedPages.get(placedField.page),
+      geometry,
+    );
 
     await stampFieldValue(
       field,
@@ -1377,13 +2595,61 @@ export async function renderFinalizedEnvelopePdf(
       imageCache,
       pdfDocument,
       storageService,
+      geometry,
     );
 
-    const manifestation =
-      field.type === "signature" ? manifestations.get(field.signerId) : null;
+    if (manifestations.size > 0) {
+      let pageContext = pageManifestations.get(placedField.page);
 
-    if (manifestation) {
-      stampSignatureManifestation(field, page, faces.regular, manifestation);
+      if (!pageContext) {
+        pageContext = {
+          allFieldBoxes: [],
+          geometry,
+          page,
+          targets: [],
+        };
+        pageManifestations.set(placedField.page, pageContext);
+      }
+
+      const rect = normalizedRectToPdfRect(field, geometry);
+
+      pageContext.allFieldBoxes.push({
+        box: rectToPageBox(rect),
+        field,
+      });
+
+      const manifestation =
+        field.type === "signature" ? manifestations.get(field.signerId) : null;
+
+      if (manifestation) {
+        pageContext.targets.push({ field, rect, text: manifestation });
+      }
+    }
+  }
+
+  for (const pageContext of pageManifestations.values()) {
+    if (pageContext.targets.length === 0) {
+      continue;
+    }
+
+    const placed = layoutPageManifestations(
+      pageContext.targets,
+      pageContext.allFieldBoxes,
+      pageContext.geometry,
+      faces.regular,
+    );
+
+    for (const target of pageContext.targets) {
+      const placement = placed.get(target.field);
+
+      if (placement) {
+        await stampSignatureManifestation(
+          pageContext.page,
+          pageContext.geometry,
+          faces.regular,
+          placement,
+        );
+      }
     }
   }
 
@@ -1414,6 +2680,7 @@ export async function finalizeEnvelope(
     copyRecipients?: readonly CertificateCopyRecipient[];
     envelope: EnvelopeRecord;
     fields: FieldRecord[];
+    pages: readonly StoredPageSize[];
     signers: SignerRecord[];
     sourcePdf: StorageObjectRef;
   },
@@ -1444,6 +2711,7 @@ export async function finalizeEnvelope(
           copyRecipients: input.copyRecipients,
           envelope: input.envelope,
           fields: input.fields,
+          pages: input.pages,
           signers: input.signers,
           sourcePdfKey: input.sourcePdf.key,
         },
