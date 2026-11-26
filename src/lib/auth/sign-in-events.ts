@@ -8,6 +8,7 @@ import {
 
 import { getDb, queryOne } from "../db/connection.ts";
 import { logSecurityEvent } from "../security/logging.ts";
+import { consumeRateLimit } from "../security/rate-limit.ts";
 import { enforceSessionLimits } from "../session-controls.ts";
 import { getSettings, isMissingSchemaError } from "../settings.ts";
 import {
@@ -25,6 +26,7 @@ import {
   getSignInLockState,
   MAX_FAILED_SIGN_INS,
   SIGN_IN_LOCKED_MESSAGE,
+  userHasPassword,
 } from "../sign-in-security.ts";
 
 // Puts sign-ins and changes to how people sign in into the install's audit
@@ -42,6 +44,14 @@ const SECOND_STEP_PATHS = new Set([
   "/two-factor/verify-backup-code",
   "/two-factor/verify-otp",
   "/two-factor/verify-totp",
+]);
+
+// Two-step management endpoints that verify the account's password.
+const PASSWORD_TWO_FACTOR_PATHS = new Set([
+  "/two-factor/disable",
+  "/two-factor/enable",
+  "/two-factor/generate-backup-codes",
+  "/two-factor/get-totp-uri",
 ]);
 
 // Paths whose actor is only known before the endpoint runs: each replaces
@@ -154,6 +164,21 @@ async function findUserIdByEmail(email: string): Promise<string | null> {
   );
 
   return row?.id ?? null;
+}
+
+/** Failed sign-ins to addresses with no account recorded per hour per address. */
+export const UNKNOWN_ADDRESS_FAILURES_RECORDED_PER_HOUR = 20;
+
+async function mayRecordUnknownAddressFailure(
+  ctx: HookContext,
+): Promise<boolean> {
+  const decision = await consumeRateLimit({
+    key: `audit-unknown-sign-in:${requestDetails(ctx).ipAddress ?? "unknown"}`,
+    limit: UNKNOWN_ADDRESS_FAILURES_RECORDED_PER_HOUR,
+    windowMs: 60 * 60 * 1000,
+  });
+
+  return decision.allowed;
 }
 
 /**
@@ -287,6 +312,28 @@ export function signInEvents() {
           }),
         },
         {
+          // Two-step sign-in here protects password sign-in and verifies the
+          // account's password before changing settings. Someone who only signs
+          // in through an identity provider has no password here; refusing
+          // early avoids a misleading "Invalid password" error.
+          matcher: (ctx) => PASSWORD_TWO_FACTOR_PATHS.has(ctx.path ?? ""),
+          handler: createAuthMiddleware(async (ctx) => {
+            const session = await getSessionFromCtx(ctx).catch(() => null);
+
+            if (!session) {
+              return;
+            }
+
+            if (!(await userHasPassword(session.user.id))) {
+              throw new APIError("BAD_REQUEST", {
+                code: "PASSWORD_REQUIRED_FOR_TWO_FACTOR",
+                message:
+                  "This account signs in with single sign-on and has no password here. Two-step sign-in is managed by your identity provider.",
+              });
+            }
+          }),
+        },
+        {
           // An install that requires two-step sign-in does not let anyone
           // turn theirs off. An administrator can still reset it for
           // someone who lost their phone, and they set it up again.
@@ -412,6 +459,22 @@ async function afterPasswordSignIn(
     const wrongPassword = code !== "EMAIL_NOT_VERIFIED";
     const counted = wrongPassword ? await countFailedSignIn(email) : null;
     const userId = await findUserIdByEmail(email).catch(() => null);
+
+    // Tries at addresses with no account are kept in the audit trail, which
+    // is never cut, only up to a number an hour from each address they come
+    // from. The rest are logged, so trying made-up addresses cannot grow
+    // the trail without end.
+    if (!userId && !(await mayRecordUnknownAddressFailure(ctx))) {
+      logSecurityEvent("warn", {
+        category: "sign_in_failed_unrecorded",
+        ipAddress: requestDetails(ctx).ipAddress,
+        message:
+          "A sign-in to an address with no account failed; too many from this address this hour to record each one.",
+        userId: null,
+      });
+
+      return;
+    }
 
     await record(ctx, {
       actorEmail: email,

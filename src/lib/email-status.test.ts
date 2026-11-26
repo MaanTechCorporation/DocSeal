@@ -14,6 +14,7 @@ import { resolveSettings, type AppSettings } from "./settings.ts";
 const stored: AppSettings = {
   allowedEmailDomains: ["acme.com"],
   brandColor: null,
+  consentDisclosure: null,
   emailReadyAt: null,
   logoVersion: null,
   organizationName: "Acme Corp",
@@ -142,10 +143,113 @@ function fakeResend(
   };
 }
 
-test("the capture driver is reported as such without asking anyone", async () => {
+test("the capture driver is reported as capture only where it is allowed (issue #212)", async () => {
+  // Development and loopback production builds are allowed to capture mail.
   assert.deepEqual(await getEmailStatus({ env: { EMAIL_DRIVER: "capture" } }), {
     state: "capture",
   });
+  assert.deepEqual(
+    await getEmailStatus({
+      env: { EMAIL_DRIVER: "capture", NODE_ENV: "development" },
+    }),
+    { state: "capture" },
+  );
+  assert.deepEqual(
+    await getEmailStatus({
+      env: {
+        APP_URL: "http://localhost:3207",
+        EMAIL_DRIVER: "capture",
+        NODE_ENV: "production",
+      },
+    }),
+    { state: "capture" },
+  );
+  assert.deepEqual(
+    await getEmailStatus({
+      env: {
+        APP_URL: "http://127.0.0.1:3207",
+        EMAIL_DRIVER: "capture",
+        NODE_ENV: "production",
+      },
+    }),
+    { state: "capture" },
+  );
+
+  // Deployed production installs refuse capture, even if RESEND_API_KEY is set.
+  const deployedProductionEnv = {
+    APP_URL: "https://sign.example.com",
+    EMAIL_DRIVER: "capture",
+    NODE_ENV: "production",
+  };
+
+  assert.deepEqual(await getEmailStatus({ env: deployedProductionEnv }), {
+    onVercel: false,
+    state: "capture_refused",
+  });
+  assert.deepEqual(
+    await getEmailStatus({
+      env: { ...deployedProductionEnv, RESEND_API_KEY: "re_test_key" },
+    }),
+    {
+      onVercel: false,
+      state: "capture_refused",
+    },
+  );
+  assert.deepEqual(
+    await getEmailStatus({
+      env: { EMAIL_DRIVER: "capture", NODE_ENV: "production" },
+    }),
+    {
+      onVercel: false,
+      state: "capture_refused",
+    },
+  );
+  assert.deepEqual(await addEmailDomain({ env: deployedProductionEnv }), {
+    onVercel: false,
+    state: "capture_refused",
+  });
+  assert.deepEqual(await recheckEmailDomain({ env: deployedProductionEnv }), {
+    onVercel: false,
+    state: "capture_refused",
+  });
+
+  // Vercel always refuses capture, regardless of NODE_ENV or APP_URL.
+  assert.deepEqual(
+    await getEmailStatus({ env: { EMAIL_DRIVER: "capture", VERCEL: "1" } }),
+    {
+      onVercel: true,
+      state: "capture_refused",
+    },
+  );
+  assert.deepEqual(
+    await getEmailStatus({
+      env: {
+        EMAIL_DRIVER: "capture",
+        NODE_ENV: "production",
+        VERCEL: "1",
+        VERCEL_ENV: "production",
+        VERCEL_PROJECT_PRODUCTION_URL: "sign.example.com",
+      },
+    }),
+    {
+      onVercel: true,
+      state: "capture_refused",
+    },
+  );
+  assert.deepEqual(
+    await getEmailStatus({
+      env: {
+        APP_URL: "http://localhost:3207",
+        EMAIL_DRIVER: "capture",
+        NODE_ENV: "production",
+        VERCEL: "1",
+      },
+    }),
+    {
+      onVercel: true,
+      state: "capture_refused",
+    },
+  );
 });
 
 test("no Resend key means email is not connected", async () => {
@@ -544,18 +648,77 @@ test("a request turned away for going too fast is tried once more", async () => 
 });
 
 test("the administrator is told about email until it has been seen working", () => {
-  assert.equal(emailNeedsAttention(settings, env), true);
-  assert.equal(
-    emailNeedsAttention(
-      resolveSettings({ ...stored, emailReadyAt: 1_800_000_100 }, env),
-      env,
-    ),
-    false,
+  const readySettings = resolveSettings(
+    { ...stored, emailReadyAt: 1_800_000_100 },
+    env,
   );
-  // Nothing to set up when messages are only being captured.
+
+  assert.equal(emailNeedsAttention(settings, env), true);
+  assert.equal(emailNeedsAttention(readySettings, env), false);
+
+  // Nothing to set up when messages are legitimately being captured locally.
   assert.equal(
     emailNeedsAttention(settings, { EMAIL_DRIVER: "capture" }),
     false,
+  );
+  assert.equal(
+    emailNeedsAttention(settings, {
+      EMAIL_DRIVER: "capture",
+      NODE_ENV: "development",
+    }),
+    false,
+  );
+  assert.equal(
+    emailNeedsAttention(settings, {
+      APP_URL: "http://localhost:3207",
+      EMAIL_DRIVER: "capture",
+      NODE_ENV: "production",
+    }),
+    false,
+  );
+  assert.equal(
+    emailNeedsAttention(settings, {
+      APP_URL: "http://127.0.0.1:3207",
+      EMAIL_DRIVER: "capture",
+      NODE_ENV: "production",
+    }),
+    false,
+  );
+
+  // When capture is refused in production or on Vercel, the administrator must
+  // be warned even if Resend had previously been marked ready.
+  const deployedProductionCaptureEnv = {
+    APP_URL: "https://sign.example.com",
+    EMAIL_DRIVER: "capture",
+    NODE_ENV: "production",
+  };
+
+  assert.equal(
+    emailNeedsAttention(settings, deployedProductionCaptureEnv),
+    true,
+  );
+  assert.equal(
+    emailNeedsAttention(readySettings, deployedProductionCaptureEnv),
+    true,
+  );
+  assert.equal(
+    emailNeedsAttention(settings, {
+      EMAIL_DRIVER: "capture",
+      NODE_ENV: "production",
+    }),
+    true,
+  );
+  assert.equal(
+    emailNeedsAttention(settings, { EMAIL_DRIVER: "capture", VERCEL: "1" }),
+    true,
+  );
+  assert.equal(
+    emailNeedsAttention(readySettings, {
+      EMAIL_DRIVER: "capture",
+      NODE_ENV: "production",
+      VERCEL: "1",
+    }),
+    true,
   );
 });
 

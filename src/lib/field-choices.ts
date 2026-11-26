@@ -2,6 +2,11 @@
 // number: dropdowns, radio buttons and number fields. Shared by the field
 // editor, the signing page and the server, so all three agree.
 
+import {
+  splitIntoWholeCharacters,
+  toWellFormedText,
+} from "./whole-characters.ts";
+
 export const MAX_FIELD_OPTIONS = 20;
 export const MAX_FIELD_OPTION_LENGTH = 80;
 export const MIN_FIELD_OPTIONS = 2;
@@ -27,6 +32,51 @@ export function isNumberEntry(value: string): boolean {
   );
 }
 
+function countCodePoints(value: string): number {
+  let count = 0;
+
+  for (let index = 0; index < value.length; index += 1) {
+    if ((value.codePointAt(index) ?? 0) > 0xffff) {
+      index += 1;
+    }
+
+    count += 1;
+  }
+
+  return count;
+}
+
+// Shortens a choice to at most maxCodePoints Unicode code points (matching the
+// server's limit), cutting only between whole characters so a surrogate pair
+// or joined emoji is never split in half.
+function truncateChoiceText(value: string, maxCodePoints: number): string {
+  const wellFormed = toWellFormedText(value);
+
+  if (wellFormed.length <= maxCodePoints) {
+    return wellFormed;
+  }
+
+  if (countCodePoints(wellFormed) <= maxCodePoints) {
+    return wellFormed;
+  }
+
+  let result = "";
+  let usedCodePoints = 0;
+
+  for (const segment of splitIntoWholeCharacters(wellFormed)) {
+    const segmentCodePoints = countCodePoints(segment);
+
+    if (usedCodePoints + segmentCodePoints > maxCodePoints) {
+      break;
+    }
+
+    result += segment;
+    usedCodePoints += segmentCodePoints;
+  }
+
+  return result;
+}
+
 /**
  * The choices typed into the editor, one per line: trimmed, with empty
  * lines and repeats dropped, and no more than a dropdown can hold.
@@ -35,7 +85,10 @@ export function parseOptionLines(text: string): string[] {
   const options: string[] = [];
 
   for (const line of text.split(/\r?\n/)) {
-    const option = line.trim().slice(0, MAX_FIELD_OPTION_LENGTH).trim();
+    const option = truncateChoiceText(
+      line.trim(),
+      MAX_FIELD_OPTION_LENGTH,
+    ).trim();
 
     if (option && !options.includes(option)) {
       options.push(option);

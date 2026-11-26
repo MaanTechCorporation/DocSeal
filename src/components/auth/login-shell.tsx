@@ -12,7 +12,17 @@ import {
 } from "@/components/auth/sso-button";
 import { FieldShell, ShellButton } from "@/components/shared/form-shell";
 import { authClient } from "@/lib/auth/client";
-import { forgotPasswordSchema, loginSchema } from "@/lib/schemas/auth";
+import {
+  describePasswordRefusal,
+  newPasswordLengthError,
+  PASSWORD_TOO_LONG_MESSAGE,
+  PASSWORD_TOO_SHORT_MESSAGE,
+} from "@/lib/password-messages";
+import {
+  forgotPasswordSchema,
+  loginSchema,
+  resetPasswordSchema,
+} from "@/lib/schemas/auth";
 import {
   Dialog,
   DialogContent,
@@ -258,6 +268,12 @@ function LiveLoginShell({
       } else if (normalizedErrorMessage.includes("email not verified")) {
         setBannerMessage(verificationRequiredMessage);
         setShowResendVerification(true);
+      } else if (
+        describePasswordRefusal(result.error) === PASSWORD_TOO_LONG_MESSAGE
+      ) {
+        // No account has a password this long, so it cannot be right. Say
+        // why instead of "Something went wrong" (issue #57).
+        setErrors({ password: PASSWORD_TOO_LONG_MESSAGE });
       } else {
         setBannerMessage(
           normalizedErrorMessage.includes("invalid email or password")
@@ -628,23 +644,28 @@ function ResetPasswordCard({ resetToken }: { resetToken: string }) {
     }
 
     const formData = new FormData(event.currentTarget);
-    const trimmedPassword = String(
+    const submittedPassword = String(
       formData.get("reset-password") ?? password,
-    ).trim();
+    );
+    const validationResult = resetPasswordSchema.safeParse({
+      newPassword: submittedPassword,
+    });
 
-    if (trimmedPassword.length < 15) {
-      setError("Password must be at least 15 characters");
+    if (!validationResult.success) {
+      setError(
+        newPasswordLengthError(submittedPassword) ?? PASSWORD_TOO_SHORT_MESSAGE,
+      );
       setSuccessMessage(null);
       return;
     }
 
-    setPassword(trimmedPassword);
+    setPassword(validationResult.data.newPassword);
     setError(null);
     setSuccessMessage(null);
     setIsSubmitting(true);
 
     const result = await authClient.resetPassword({
-      newPassword: trimmedPassword,
+      newPassword: validationResult.data.newPassword,
       token: resetToken,
     });
 
@@ -654,11 +675,8 @@ function ResetPasswordCard({ resetToken }: { resetToken: string }) {
       setError(
         normalizedErrorMessage.includes("invalid token")
           ? "This reset link is invalid or has expired."
-          : normalizedErrorMessage.includes("password too short")
-            ? "Password must be at least 15 characters"
-            : normalizedErrorMessage.includes("compromised")
-              ? "Choose a password that hasn't appeared in a breach"
-              : "Something went wrong. Please try again.",
+          : (describePasswordRefusal(result.error) ??
+              "Something went wrong. Please try again."),
       );
       setIsSubmitting(false);
       return;

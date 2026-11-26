@@ -10,6 +10,8 @@ import type pg from "pg";
 import { afterStatement, openTestDatabase } from "./db/test-database.ts";
 import {
   EnvelopeMutationError,
+  FIELDS_CHANGED_MESSAGE,
+  getPrepareEnvelopeDataForUser,
   replaceDraftEnvelopeFields,
   replaceDraftEnvelopeSigners,
   sendDraftEnvelope,
@@ -373,4 +375,343 @@ test("signers saved for a draft do not land on an envelope that was sent meanwhi
     (await signersOf(draft.envelopeId)).map((signer) => signer.email),
     [draft.rileyEmail, draft.caseyEmail],
   );
+});
+
+test("sending with no email provider is refused as a setup state and leaves the draft as it was (issue #53)", async () => {
+  const draft = await createDraft();
+  const driverBefore = process.env.EMAIL_DRIVER;
+  const keyBefore = process.env.RESEND_API_KEY;
+
+  delete process.env.EMAIL_DRIVER;
+  delete process.env.RESEND_API_KEY;
+
+  try {
+    await assert.rejects(
+      sendDraftEnvelope(
+        draft.userId,
+        draft.envelopeId,
+        { senderEmail: "sam@example.test", senderName: "Sam Sender" },
+        { database },
+      ),
+      (error) => {
+        assert.ok(error instanceof EnvelopeMutationError);
+        assert.equal(error.statusCode, 503);
+        assert.match(error.message, /Email is not set up yet/);
+        assert.match(error.message, /Settings, Organization/);
+        return true;
+      },
+    );
+  } finally {
+    process.env.EMAIL_DRIVER = driverBefore;
+
+    if (keyBefore === undefined) {
+      delete process.env.RESEND_API_KEY;
+    } else {
+      process.env.RESEND_API_KEY = keyBefore;
+    }
+  }
+
+  assert.equal(await statusOf(draft.envelopeId), "draft");
+
+  const { rows: signers } = await database.query<{
+    signing_token_hash: string | null;
+    status: string;
+  }>(`select status, signing_token_hash from signers where envelope_id = $1`, [
+    draft.envelopeId,
+  ]);
+
+  assert.ok(signers.every((signer) => signer.status === "pending"));
+  assert.ok(signers.every((signer) => signer.signing_token_hash === null));
+
+  const { rows: sent } = await database.query(
+    `select 1 from audit_events where envelope_id = $1 and event = 'sent'`,
+    [draft.envelopeId],
+  );
+
+  assert.equal(sent.length, 0);
+});
+
+test("a field save made on an older page does not overwrite a newer one", async () => {
+  const draft = await createDraft();
+  // Two field editors opened on the same list: the one the sender is
+  // leaving, and the one they open on coming back.
+  const opened = await getPrepareEnvelopeDataForUser(
+    draft.userId,
+    draft.envelopeId,
+    { database },
+  );
+  const seenRevision = opened?.fieldsRevision;
+
+  assert.equal(typeof seenRevision, "number");
+
+  // The page they came back to saves first.
+  const saved = await replaceDraftEnvelopeFields(
+    draft.userId,
+    draft.envelopeId,
+    {
+      expectedRevision: seenRevision,
+      fields: [field(draft.casey, "signature", 0.7)],
+    },
+    database,
+  );
+
+  assert.equal(saved.fieldsRevision, seenRevision! + 1);
+
+  // The departing page's save lands afterwards, against the older list.
+  await assert.rejects(
+    replaceDraftEnvelopeFields(
+      draft.userId,
+      draft.envelopeId,
+      {
+        expectedRevision: seenRevision,
+        fields: [field(draft.riley, "signature", 0.5)],
+      },
+      database,
+    ),
+    refusedWith(409, new RegExp(FIELDS_CHANGED_MESSAGE.slice(0, 30))),
+  );
+
+  assert.deepEqual(await fieldSignersOf(draft.envelopeId), [draft.casey]);
+
+  // A save that names no revision (a template filling a new draft, say)
+  // still goes through.
+  const unchecked = await replaceDraftEnvelopeFields(
+    draft.userId,
+    draft.envelopeId,
+    { fields: [field(draft.riley, "signature", 0.5)] },
+    database,
+  );
+
+  assert.equal(unchecked.fieldsRevision, seenRevision! + 2);
+  assert.deepEqual(await fieldSignersOf(draft.envelopeId), [draft.riley]);
+});
+
+test("a field save overlapping with signer removal is refused cleanly instead of hitting the foreign key (issue #224)", async () => {
+  const draft = await createDraft();
+  const opened = await getPrepareEnvelopeDataForUser(
+    draft.userId,
+    draft.envelopeId,
+    { database },
+  );
+  const seenRevision = opened?.fieldsRevision;
+
+  assert.equal(typeof seenRevision, "number");
+
+  // Place fields starts saving with both signers; before it takes the draft
+  // lock, Add signers removes Casey.
+  await assert.rejects(
+    replaceDraftEnvelopeFields(
+      draft.userId,
+      draft.envelopeId,
+      {
+        expectedRevision: seenRevision,
+        fields: [
+          field(draft.riley, "signature", 0.3),
+          field(draft.casey, "signature", 0.4),
+        ],
+      },
+      onceAfter(
+        (text, values) =>
+          text.includes("FROM envelope_pages") &&
+          values[0] === draft.envelopeId,
+        () =>
+          replaceDraftEnvelopeSigners(
+            draft.userId,
+            draft.envelopeId,
+            {
+              signers: [
+                {
+                  email: draft.rileyEmail,
+                  id: draft.riley,
+                  name: "Riley Recipient",
+                },
+              ],
+            },
+            database,
+          ),
+      ),
+    ),
+    refusedWith(409, new RegExp(FIELDS_CHANGED_MESSAGE.slice(0, 30))),
+  );
+
+  // Casey and Casey's field are gone, Riley's field is untouched, and
+  // fields_revision moved on.
+  assert.deepEqual(
+    (await signersOf(draft.envelopeId)).map((signer) => signer.email),
+    [draft.rileyEmail],
+  );
+  assert.deepEqual(await fieldSignersOf(draft.envelopeId), [draft.riley]);
+
+  const reloaded = await getPrepareEnvelopeDataForUser(
+    draft.userId,
+    draft.envelopeId,
+    { database },
+  );
+
+  assert.equal(reloaded?.fieldsRevision, seenRevision! + 1);
+});
+
+test("an unchecked field save overlapping with signer removal is refused as 400 inside the lock (issue #224)", async () => {
+  const draft = await createDraft();
+
+  await assert.rejects(
+    replaceDraftEnvelopeFields(
+      draft.userId,
+      draft.envelopeId,
+      {
+        fields: [
+          field(draft.riley, "signature", 0.3),
+          field(draft.casey, "signature", 0.4),
+        ],
+      },
+      onceAfter(
+        (text, values) =>
+          text.includes("FROM envelope_pages") &&
+          values[0] === draft.envelopeId,
+        () =>
+          replaceDraftEnvelopeSigners(
+            draft.userId,
+            draft.envelopeId,
+            {
+              signers: [
+                {
+                  email: draft.rileyEmail,
+                  id: draft.riley,
+                  name: "Riley Recipient",
+                },
+              ],
+            },
+            database,
+          ),
+      ),
+    ),
+    refusedWith(400, /existing signer/),
+  );
+
+  assert.deepEqual(await fieldSignersOf(draft.envelopeId), [draft.riley]);
+});
+
+test("a field save overlapping with changing a signer to an approver is refused cleanly (issue #224)", async () => {
+  const draft = await createDraft();
+  const opened = await getPrepareEnvelopeDataForUser(
+    draft.userId,
+    draft.envelopeId,
+    { database },
+  );
+  const seenRevision = opened?.fieldsRevision;
+
+  assert.equal(typeof seenRevision, "number");
+
+  await assert.rejects(
+    replaceDraftEnvelopeFields(
+      draft.userId,
+      draft.envelopeId,
+      {
+        expectedRevision: seenRevision,
+        fields: [
+          field(draft.riley, "signature", 0.3),
+          field(draft.casey, "signature", 0.4),
+        ],
+      },
+      onceAfter(
+        (text, values) =>
+          text.includes("FROM envelope_pages") &&
+          values[0] === draft.envelopeId,
+        () =>
+          replaceDraftEnvelopeSigners(
+            draft.userId,
+            draft.envelopeId,
+            {
+              signers: [
+                {
+                  email: draft.rileyEmail,
+                  id: draft.riley,
+                  name: "Riley Recipient",
+                  role: "signer",
+                },
+                {
+                  email: draft.caseyEmail,
+                  id: draft.casey,
+                  name: "Casey Second",
+                  role: "approver",
+                },
+              ],
+            },
+            database,
+          ),
+      ),
+    ),
+    refusedWith(409, new RegExp(FIELDS_CHANGED_MESSAGE.slice(0, 30))),
+  );
+
+  assert.deepEqual(await fieldSignersOf(draft.envelopeId), [draft.riley]);
+});
+
+test("a stale signer save referencing a concurrently removed signer returns 409 without recreating it", async () => {
+  const draft = await createDraft();
+
+  await replaceDraftEnvelopeSigners(
+    draft.userId,
+    draft.envelopeId,
+    {
+      signers: [
+        { email: draft.rileyEmail, id: draft.riley, name: "Riley Recipient" },
+        {
+          accessCode: "secret-code-42",
+          email: draft.caseyEmail,
+          id: draft.casey,
+          name: "Casey Second",
+        },
+      ],
+    },
+    database,
+  );
+
+  await assert.rejects(
+    replaceDraftEnvelopeSigners(
+      draft.userId,
+      draft.envelopeId,
+      {
+        signers: [
+          { email: draft.rileyEmail, id: draft.riley, name: "Riley Renamed" },
+          { email: draft.caseyEmail, id: draft.casey, name: "Casey Second" },
+        ],
+      },
+      onceAfter(
+        (text, values) =>
+          text.includes("FROM signers") &&
+          text.includes("role = 'cc'") &&
+          values[0] === draft.envelopeId,
+        () =>
+          replaceDraftEnvelopeSigners(
+            draft.userId,
+            draft.envelopeId,
+            {
+              signers: [
+                {
+                  email: draft.rileyEmail,
+                  id: draft.riley,
+                  name: "Riley Recipient",
+                },
+              ],
+            },
+            database,
+          ),
+      ),
+    ),
+    refusedWith(409, /Reload the page/),
+  );
+
+  const remaining = await database.query<{
+    access_code_hash: string | null;
+    id: string;
+    name: string;
+  }>(
+    `SELECT id, name, access_code_hash FROM signers WHERE envelope_id = $1 ORDER BY sign_order`,
+    [draft.envelopeId],
+  );
+
+  assert.deepEqual(remaining.rows, [
+    { access_code_hash: null, id: draft.riley, name: "Riley Recipient" },
+  ]);
 });

@@ -14,7 +14,11 @@ import { openTestDatabase } from "../db/test-database.ts";
 import { clearRateLimitStoreForTests } from "../security/rate-limit.ts";
 import { listSystemAuditEvents } from "../services/system-audit.ts";
 import { invalidateSettingsCache, saveSettings } from "../settings.ts";
-import { needsTwoFactorSetup } from "../sign-in-security.ts";
+import {
+  needsTwoFactorSetup,
+  setTwoFactorRequirement,
+  userHasPassword,
+} from "../sign-in-security.ts";
 
 // Single sign-on against a real Postgres, the real Better Auth endpoints and
 // a small OpenID Connect provider run here: discovery, signed ID tokens and
@@ -36,9 +40,10 @@ registerHooks({
 
 type Profile = {
   email?: string;
-  email_verified?: boolean;
+  email_verified?: unknown;
   name: string;
   sub: string;
+  xms_edov?: unknown;
 };
 
 let database: pg.Pool;
@@ -328,6 +333,7 @@ test("a first sign-in through the identity provider makes a verified account and
   const auth = await makeAuth();
   const { cookies, location } = await signInWithSso(auth, {
     email: "Pat@Acme.com",
+    email_verified: true,
     name: "Pat Person",
     sub: "okta-pat",
   });
@@ -337,8 +343,6 @@ test("a first sign-in through the identity provider makes a verified account and
   const user = await sessionUser(auth, cookies);
 
   assert.equal(user?.email, "pat@acme.com");
-  // Entra ID leaves email_verified out; the organization's directory is
-  // trusted for its own addresses.
   assert.equal(user?.emailVerified, true);
 
   const events = await listSystemAuditEvents({ limit: 100 }, database);
@@ -412,6 +416,7 @@ test("the sign-up rule holds for single sign-on too", async () => {
 
   const allowed = await signInWithSso(auth, {
     email: "sam@acme.com",
+    email_verified: true,
     name: "Sam",
     sub: "google-sam",
   });
@@ -437,6 +442,68 @@ test("an address the provider says is unverified is not tied to an existing acco
   assert.equal(location.pathname, "/login");
   assert.ok(location.searchParams.get("error"));
   assert.equal(await sessionUser(auth, cookies), null);
+});
+
+test("an address the provider does not vouch for never reaches an existing administrator", async () => {
+  const auth = await makeAuth();
+  const adminId = randomUUID();
+
+  await database.query(
+    `insert into "user" (id, name, email, "emailVerified", role) values ($1, 'Pat', 'pat@acme.com', true, 'admin')`,
+    [adminId],
+  );
+
+  // Left out (as Entra ID does), null, or anything that is not a plain yes.
+  const claims: Array<Partial<Profile>> = [
+    {},
+    { email_verified: null },
+    { email_verified: 1 },
+    { email_verified: "yes" },
+    { email_verified: "False" },
+    { xms_edov: false },
+  ];
+
+  for (const [index, claim] of claims.entries()) {
+    const { cookies } = await signInWithSso(auth, {
+      email: "pat@acme.com",
+      name: "Pat",
+      sub: `intruder-${String(index)}`,
+      ...claim,
+    });
+
+    assert.notEqual(
+      (await sessionUser(auth, cookies))?.id,
+      adminId,
+      JSON.stringify(claim),
+    );
+  }
+
+  const { rows } = await database.query<{ count: string }>(
+    `select count(*)::text as count from account where "userId" = $1 and "providerId" = 'sso'`,
+    [adminId],
+  );
+
+  assert.equal(rows[0]?.count, "0");
+});
+
+test("an Entra ID sign-in whose tenant owns the address's domain reaches the existing account", async () => {
+  const auth = await makeAuth();
+  const id = randomUUID();
+
+  await database.query(
+    `insert into "user" (id, name, email, "emailVerified", role) values ($1, 'Pat', 'pat@acme.com', true, 'user')`,
+    [id],
+  );
+
+  const { cookies, location } = await signInWithSso(auth, {
+    email: "pat@acme.com",
+    name: "Pat",
+    sub: "entra-pat",
+    xms_edov: true,
+  });
+
+  assert.equal(location.pathname, "/dashboard");
+  assert.equal((await sessionUser(auth, cookies))?.id, id);
 });
 
 test("with password sign-in off, only the listed addresses may use a password", async () => {
@@ -527,22 +594,96 @@ test("requiring two-step sign-in does not hold up someone who only uses single s
   const user = await sessionUser(auth, cookies);
 
   assert.ok(user);
+  assert.equal(await userHasPassword(user.id, { database }), false);
   assert.equal(
     await needsTwoFactorSetup({ requireTwoFactor: true }, user, { database }),
     false,
   );
 
-  // Someone with a password still has to set it up.
+  // Calling the password-based two-step endpoints directly explains why
+  // instead of returning a misleading INVALID_PASSWORD error.
+  const enableAttempt = await post(
+    auth,
+    "/two-factor/enable",
+    { issuer: "Acme Sign", password: PASSWORD },
+    cookies,
+  );
+
+  assert.equal(enableAttempt.status, 400);
+  assert.equal(enableAttempt.payload?.code, "PASSWORD_REQUIRED_FOR_TWO_FACTOR");
+
+  const codesAttempt = await post(
+    auth,
+    "/two-factor/generate-backup-codes",
+    { password: PASSWORD },
+    cookies,
+  );
+
+  assert.equal(codesAttempt.status, 400);
+  assert.equal(codesAttempt.payload?.code, "PASSWORD_REQUIRED_FOR_TWO_FACTOR");
+
+  // An SSO-only administrator can require two-step sign-in for password
+  // accounts without being told to set it up on their own passwordless account.
+  await database.query(`update "user" set role = 'admin' where id = $1`, [
+    user.id,
+  ]);
+  await setTwoFactorRequirement(
+    { email: user.email, userId: user.id },
+    true,
+    database,
+  );
+  invalidateSettingsCache();
+
+  const disableAttempt = await post(
+    auth,
+    "/two-factor/disable",
+    { password: PASSWORD },
+    cookies,
+  );
+
+  assert.equal(disableAttempt.status, 400);
+  assert.equal(
+    disableAttempt.payload?.code,
+    "PASSWORD_REQUIRED_FOR_TWO_FACTOR",
+  );
+
+  // A credential row with a NULL password does not count as having a password.
+  const emptyCredId = randomUUID();
+
+  await database.query(
+    `insert into account (id, "accountId", "providerId", "userId", password) values ($1, $2, 'credential', $2, null)`,
+    [emptyCredId, user.id],
+  );
+  assert.equal(await userHasPassword(user.id, { database }), false);
+  assert.equal(
+    await needsTwoFactorSetup({ requireTwoFactor: true }, user, { database }),
+    false,
+  );
+  await database.query(`delete from account where id = $1`, [emptyCredId]);
+
+  // Someone with BOTH SSO and a password still has to set it up, and can.
   const context = await auth.$context;
 
   await database.query(
     `insert into account (id, "accountId", "providerId", "userId", password) values ($1, $2, 'credential', $2, $3)`,
     [randomUUID(), user.id, await context.password.hash(PASSWORD)],
   );
+  assert.equal(await userHasPassword(user.id, { database }), true);
   assert.equal(
     await needsTwoFactorSetup({ requireTwoFactor: true }, user, { database }),
     true,
   );
+
+  const hybridEnable = await post(
+    auth,
+    "/two-factor/enable",
+    { issuer: "Acme Sign", password: PASSWORD },
+    cookies,
+  );
+
+  assert.equal(hybridEnable.status, 200, JSON.stringify(hybridEnable.payload));
+  assert.ok(typeof hybridEnable.payload?.totpURI === "string");
+  assert.equal((hybridEnable.payload?.backupCodes as string[])?.length, 10);
 });
 
 test("an ID token posted straight to the sign-in route is refused, not signed in unaudited", async () => {

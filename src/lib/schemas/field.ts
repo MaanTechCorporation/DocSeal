@@ -7,6 +7,7 @@ import {
   MAX_RADIO_GROUP_BUTTONS,
 } from "../field-choices.ts";
 import { fieldInputMethods, fieldTypes } from "../types/domain.ts";
+import { toWellFormedText } from "../whole-characters.ts";
 import {
   idSchema,
   normalizedCoordinateSchema,
@@ -17,6 +18,19 @@ import {
 
 export const fieldTypeSchema = z.enum(fieldTypes);
 export const fieldInputMethodSchema = z.enum(fieldInputMethods);
+
+function isWellFormedUnicode(value: string): boolean {
+  return typeof value.isWellFormed === "function"
+    ? value.isWellFormed()
+    : toWellFormedText(value) === value;
+}
+
+const fieldOptionSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(MAX_FIELD_OPTION_LENGTH)
+  .refine(isWellFormedUnicode, "Each choice must contain valid Unicode text");
 
 export const MAX_DRAWN_SIGNATURE_BYTES = 256 * 1024;
 const MAX_DRAWN_SIGNATURE_DATA_URL_LENGTH =
@@ -38,14 +52,19 @@ export const fieldPlacementSchema = z
     label: optionalTrimmedString(120),
     // The choices of a dropdown. A draft may hold fewer than two while the
     // sender is still typing them; sending checks for that.
-    options: z
-      .array(z.string().trim().min(1).max(MAX_FIELD_OPTION_LENGTH))
-      .max(MAX_FIELD_OPTIONS)
-      .optional(),
+    options: z.array(fieldOptionSchema).max(MAX_FIELD_OPTIONS).optional(),
     // The group a radio button belongs to. The signer picks one per group.
     groupId: z.string().trim().min(1).max(64).optional(),
   })
   .superRefine((field, ctx) => {
+    if (field.label !== undefined && !isWellFormedUnicode(field.label)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Field label must contain valid Unicode text",
+        path: ["label"],
+      });
+    }
+
     if (field.options !== undefined && field.type !== "dropdown") {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -95,7 +114,8 @@ export const fieldPlacementSchema = z
     if (
       (field.type === "signature" ||
         field.type === "initials" ||
-        field.type === "date") &&
+        field.type === "date" ||
+        field.type === "name") &&
       !field.required
     ) {
       ctx.addIssue({
@@ -157,6 +177,12 @@ export const fieldPlacementListSchema = z
   });
 
 export const replaceFieldsSchema = z.object({
+  /**
+   * The field list's revision the editor last saw. When it is given and the
+   * list has been saved since, the save is refused instead of overwriting
+   * the newer list. Left out, the save always goes through.
+   */
+  expectedRevision: z.number().int().min(0).optional(),
   fields: fieldPlacementListSchema,
 });
 
@@ -167,6 +193,8 @@ export const replaceFieldsResponseSchema = z.object({
       id: idSchema,
     }),
   ),
+  /** The field list's revision after this save. */
+  fieldsRevision: z.number().int().min(0),
   redirectPath: z.string().trim().min(1),
   updatedAt: unixTimestampSchema,
 });
@@ -225,7 +253,7 @@ const numberSubmissionSchema = z.object({
 const dropdownSubmissionSchema = z.object({
   fieldId: idSchema,
   type: z.literal("dropdown"),
-  value: z.string().trim().min(1).max(MAX_FIELD_OPTION_LENGTH),
+  value: fieldOptionSchema,
 });
 
 const radioSubmissionSchema = z.object({
