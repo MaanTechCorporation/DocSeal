@@ -3,6 +3,11 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 
 import { getDb, withTransaction, type DbPool } from "./db/connection.ts";
+import {
+  PASSWORD_MAX_LENGTH,
+  PASSWORD_MIN_LENGTH,
+  PASSWORD_TOO_SHORT_MESSAGE,
+} from "./password-messages.ts";
 import { emailSchema, nameSchema } from "./schemas/common.ts";
 import {
   closeSignupUntilSetupFinishes,
@@ -129,14 +134,14 @@ const baseSetupSchema = z.object({
 const createAccountSchema = z.object({
   email: emailSchema,
   fullName: nameSchema,
-  password: z.string().min(15).max(128),
+  password: z.string().min(PASSWORD_MIN_LENGTH).max(PASSWORD_MAX_LENGTH),
 });
 
 const FIELD_MESSAGES: Record<SetupFieldName, string> = {
   email: "Enter a valid email address",
   fullName: "Enter your full name",
   organizationName: "Enter the name of your organization",
-  password: "Password must be at least 15 characters",
+  password: PASSWORD_TOO_SHORT_MESSAGE,
   senderAddress: "Enter a valid email address, or leave this empty",
   setupToken: "Enter the setup token",
   supportAddress: "Enter an email address people can write to for help",
